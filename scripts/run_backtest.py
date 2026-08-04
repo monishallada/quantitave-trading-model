@@ -30,12 +30,14 @@ def strategies_factory(settings, state=None, include_llm=False):
     def factory():
         if settings.risk_profile == "explosive":
             # options-first ordering; mean_reversion dropped (see run_paper.py)
-            out = [PutIncomeStrategy(), ConvexMomentumStrategy(calls_enabled=False),  # crash convexity only
+            out = [PutIncomeStrategy(min_dte=7, max_dte=21, exit_dte=3), ConvexMomentumStrategy(calls_enabled=False),  # crash convexity only
                    MomentumStrategy(top_n=5, deploy_fraction=1.0,
                                     max_name_weight=0.45,
-                                    express_via="options", option_delta=0.75,
+                                    express_via="options", option_delta=0.80,
                                     option_leverage=5.0,
-                                    option_max_premium_weight=0.70),
+                                    option_max_premium_weight=0.70,
+                                    option_min_dte=7, option_max_dte=21,
+                                    option_roll_dte=4),
                    # equity momentum last: validated OOS core, constrained
                    MomentumStrategy(top_n=3, deploy_fraction=0.55,
                                     max_name_weight=0.20, express_via="equity",

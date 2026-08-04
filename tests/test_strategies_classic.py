@@ -302,3 +302,42 @@ class TestMomentumOptionsMode:
                   for s in restricted.generate_signals(snap, ctx_for("m"))
                   if s.action == SignalAction.TARGET_WEIGHT}
         assert picks2 == {"AAPL"}
+
+    def test_short_dated_itm_cheaper_for_same_delta(self):
+        """1-3 week deep-ITM calls cost less than 45-90 DTE for the SAME delta
+        exposure — the saving comes out of decayable time value, not intrinsic.
+        This is what makes short tenors capital-efficient for ITM (and what
+        makes them ruinous for OTM)."""
+        from conftest import make_chain
+        from datetime import timedelta
+        closes = wiggly_series(drift=0.004)
+        spot = closes[-1]
+        bars = {"STRONG": make_bars(closes, end_ts=T0)}
+        quotes = {"STRONG": make_quote(spot, ts=T0)}
+        # near chain (14 DTE) and far chain (60 DTE) on the same underlying:
+        # far carries more time value at the same strike
+        near = make_chain("STRONG", spot=spot, ts=T0,
+                          expiry=(T0 + timedelta(days=14)).date(),
+                          strikes=(spot * 0.85, spot * 0.9, spot),
+                          premium_base=6.0)
+        far = make_chain("STRONG", spot=spot, ts=T0,
+                         expiry=(T0 + timedelta(days=60)).date(),
+                         strikes=(spot * 0.85, spot * 0.9, spot),
+                         premium_base=14.0)
+        merged = type(near)(underlying="STRONG", ts=T0, underlying_price=spot,
+                            quotes=near.quotes + far.quotes)
+        snap = MarketSnapshot(as_of=T0, bars=bars, quotes=quotes,
+                              option_chains={"STRONG": merged})
+        short_s = MomentumStrategy(top_n=1, express_via="options",
+                                   option_delta=0.80, option_min_dte=7,
+                                   option_max_dte=21, option_roll_dte=4)
+        long_s = MomentumStrategy(top_n=1, express_via="options",
+                                  option_delta=0.80, option_min_dte=45,
+                                  option_max_dte=90)
+        a = [x for x in short_s.generate_signals(snap, ctx_for("m"))
+             if x.action == SignalAction.TARGET_WEIGHT][0]
+        b = [x for x in long_s.generate_signals(snap, ctx_for("m"))
+             if x.action == SignalAction.TARGET_WEIGHT][0]
+        assert a.rationale_payload["dte"] <= 21
+        assert b.rationale_payload["dte"] >= 45
+        assert a.rationale_payload["premium_mid"] < b.rationale_payload["premium_mid"]

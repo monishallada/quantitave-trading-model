@@ -89,7 +89,7 @@ def build_platform():
         # -0.9% full period / +0.1% OOS, i.e. it earned nothing while
         # consuming equity budget the options sleeves need.
         strategies = [
-            PutIncomeStrategy(),
+            PutIncomeStrategy(min_dte=7, max_dte=21, exit_dte=3),
             ConvexMomentumStrategy(calls_enabled=False),  # crash convexity only
             # top_n=3 + 0.65 delta: concentrate the sleeve's capital so it can
             # always afford whole contracts (5 names x deep-ITM premium
@@ -99,9 +99,11 @@ def build_platform():
             # expression the 2023-25 evidence supports. Portfolio premium at
             # risk is bounded by RiskLimits.max_long_option_premium_pct.
             MomentumStrategy(top_n=5, deploy_fraction=1.0, max_name_weight=0.45,
-                             express_via="options", option_delta=0.75,
+                             express_via="options", option_delta=0.80,
                              option_leverage=5.0,
-                             option_max_premium_weight=0.70),
+                             option_max_premium_weight=0.70,
+                             option_min_dte=7, option_max_dte=21,
+                             option_roll_dte=4),
             # Equity momentum LAST: it is the single best OOS-validated engine
             # in the platform (2023-25 walk-forward Sharpe 1.47) and lifts
             # portfolio OOS from ~-0.3 to ~+1.1. Deliberately constrained so it
