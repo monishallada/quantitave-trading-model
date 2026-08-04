@@ -30,7 +30,7 @@ uv pip install --python .venv/bin/python -e ".[dev]"
 # 2. configure
 cp .env.example .env          # then edit .env — see "Keys" below
 
-# 3. verify everything (offline, no keys needed — all 151 tests must pass)
+# 3. verify everything (offline, no keys needed — all 200 tests must pass)
 .venv/bin/python -m pytest
 
 # 4. run the paper-trading loop + dashboard
@@ -82,13 +82,51 @@ you can watch the entire platform work before wiring credentials.
 | `core/portfolio.py` | Unified equity+options accounting: cash, cost basis, realized/unrealized P&L, exposures, **net Greeks** ($ delta, gamma, theta/day, vega). |
 | `core/greeks.py` | Black-Scholes pricing/Greeks/IV (fallback when the chain has no Greeks). |
 | `data/` | `DataProvider` interface; `AlpacaDataProvider` (daily bars IEX + quotes + option chain w/ Greeks + date-pinned news, on-disk bar cache); `SyntheticProvider` (seeded GBM, offline). News that can't be date-pinned is **excluded** from snapshots by construction. |
-| `strategies/` | `Strategy` interface; `momentum` (12-1 cross-sectional, **inverse-vol sized, absolute-momentum filtered** — goes to cash when everything is falling), `mean_reversion` (5d z-score, **entries only above the 200d SMA** — buys dips in uptrends, never falling knives; stands down in high-vol regimes), `put_income` (**volatility-risk-premium sleeve**: cash-secured ~30-delta 30–45 DTE puts, min 8% annualized premium yield, 50% profit-take / 7-DTE time exit / 2.5× loss stop, no new entries in high-vol), `llm_agents/` (see below). |
+| `strategies/` | `Strategy` interface. **`momentum`** — 12-1 cross-sectional, inverse-vol sized, absolute-momentum filtered; expresses via shares OR **deep-ITM calls** (`express_via="options"`, stock replacement). **`put_income`** — volatility-risk-premium: cash-secured ~30-delta puts, min 8% annualized yield, 50% profit-take / time exit / 2.5x loss stop. **`convexity`** — long options for crash/breakout convexity (puts-only by default). **`mean_reversion`** — 5d z-score dip-buying above the 200d SMA. `llm_agents/` (see below). |
 | `allocation/allocator.py` | Risk-adjusted (Sharpe, shrunk toward equal weight) with pairwise-correlation penalty; per-sleeve floor 5% / cap 40%; **portfolio vol targeting** — deployment scales down when realized vol exceeds the 12% annual target (floor 30%). |
 | `execution/` | `Broker` interface; `SimBroker` (fills through the cost model); `AlpacaPaperBroker` (alpaca-py, paper-only, single- and multi-leg MLEG option orders, fill/position sync, flatten-all). |
 | `risk/` | `RiskManager` pre-trade gate, `CircuitBreakerBoard` (7 breakers), `KillSwitch`. |
 | `backtest/` | Event-driven daily engine (**t+1 execution** — signals from day *d*'s close fill at day *d+1*'s open through the cost model, never same-bar), walk-forward with **purge/embargo**, metrics (CAGR/Sharpe/Sortino/maxDD/hit rate/turnover). |
 | `live/runner.py` | The paper loop: snapshot → broker sync → breakers → allocate → signals → risk gate → orders → fills → state. One iteration can never crash the loop. |
 | `dashboard/` | FastAPI + one self-contained HTML file (no CDN). |
+
+### Risk profiles (`QF_RISK_PROFILE` in .env)
+
+`conservative` (default) or `explosive`. Explosive is a **high-variance paper-testing**
+configuration: wide limits, options-first sleeve ordering, and up to **50% of equity in
+long-option premium**. Undefined-risk (naked short) options stay banned in both.
+
+| Limit | conservative | explosive |
+|---|---|---|
+| Per-underlying exposure | 10% | 55% |
+| Per-sector | 25% | 60% |
+| Gross leverage | 1.0x | 2.0x |
+| \|Net $ delta\| | 80% | 300% |
+| **Long-option premium at risk** | **10%** | **50%** |
+| Daily loss halt (flattens) | -2% | -15% |
+| Max drawdown halt | -10% | -40% |
+| Short equity | banned | allowed |
+
+The premium cap is the one that bounds the worst case: loss on a long option is capped at
+its premium **per position**, but premium that all expires worthless is a 100% loss of every
+dollar deployed. 50% is sized for **deep-ITM** contracts (0.80 delta), which retain intrinsic
+value when wrong — it would be reckless for OTM.
+
+### What the evidence actually says (2023-2025 walk-forward, real Alpaca bars)
+
+Judge sleeves on **out-of-sample** columns only. Six validation runs to date:
+
+| Sleeve | Instrument | OOS Sharpe | Verdict |
+|---|---|---|---|
+| `put_income` | 1-3wk cash-secured puts | +0.58 to +1.60, positive every run | validated |
+| `momentum_equity` | shares | +0.65 to +1.47 | validated |
+| `momentum` (options) | 1-3wk deep-ITM calls | +0.36 (was negative in longer-dated variants) | promising, not proven |
+| `convexity` | short-dated long options | negative in **all six** runs | disproven; kept small as a crash hedge |
+
+Caveats that matter: option chains in historical backtests are Black-Scholes-priced off
+realized vol (real historical chains aren't on the free data tier), so short-vol premium is
+~zero **by construction** and put_income's live edge may differ. And 2023-2025 is a single,
+predominantly bullish regime — nothing here has been tested through a crash.
 
 ### Honesty rules baked in
 
@@ -216,5 +254,5 @@ Be aware of these before believing any number:
 │   ├── backtest/               # engine, walkforward, metrics
 │   ├── live/                   # runner
 │   └── dashboard/              # fastapi app + static frontend
-└── tests/                      # 151 offline tests incl. leakage, kill-switch, and review-regression tests
+└── tests/                      # 200 offline tests incl. leakage, kill-switch, and regression tests
 ```
