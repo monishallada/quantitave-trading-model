@@ -331,3 +331,57 @@ class TestTransientErrors:
         assert _is_transient(RuntimeError("Remote end closed connection"))
         assert not _is_transient(ValueError("target_weight must be within [-1, 1]"))
         assert not _is_transient(KeyError("momentum"))
+
+
+class TestLongOptionPremiumCap:
+    """Loss on a long option is capped at premium — but only per position.
+    The portfolio cap is what stops every contract expiring worthless at once."""
+
+    def test_blocks_premium_beyond_cap(self, snap):
+        # every other cap wide open so the PREMIUM cap is the binding one
+        lim = RiskLimits(max_long_option_premium_pct=0.05,
+                         max_order_notional=1e9, max_position_notional=1e9,
+                         max_position_pct=50.0, max_sector_pct=50.0,
+                         max_gross_leverage=50.0, max_net_delta_pct=50.0,
+                         max_theta_pct_per_day=10.0, max_vega_pct=10.0,
+                         min_cash_buffer_pct=0.0)
+        rm = RiskManager(lim)
+        p = Portfolio(cash=100_000)
+        call = chain_contract(snap, OptionRight.CALL, 200.0)
+        # cap = 5% of $100k = $5,000; ATM call mids ~$5 => $500 of premium
+        # per contract
+        d1 = rm.check_order(single_leg(call, OrderSide.BUY, 4), p, snap)   # $2k
+        assert d1.approved, d1.reason
+        d2 = rm.check_order(single_leg(call, OrderSide.BUY, 20), p, snap)  # $10k
+        assert not d2.approved
+        assert "premium at risk" in d2.reason
+
+    def test_existing_premium_counts_toward_cap(self, snap):
+        # every other cap wide open so the PREMIUM cap is the binding one
+        lim = RiskLimits(max_long_option_premium_pct=0.05,
+                         max_order_notional=1e9, max_position_notional=1e9,
+                         max_position_pct=50.0, max_sector_pct=50.0,
+                         max_gross_leverage=50.0, max_net_delta_pct=50.0,
+                         max_theta_pct_per_day=10.0, max_vega_pct=10.0,
+                         min_cash_buffer_pct=0.0)
+        rm = RiskManager(lim)
+        p = Portfolio(cash=100_000)
+        call = chain_contract(snap, OptionRight.CALL, 200.0)
+        p.apply_fill(_fill(call, OrderSide.BUY, 8, 5.0))    # $4,000 already at risk
+        p.mark_position(call.key, 5.0, T0)
+        d = rm.check_order(single_leg(call, OrderSide.BUY, 6), p, snap)  # +$3,000
+        assert not d.approved and "premium at risk" in d.reason
+
+    def test_explosive_cap_reasoned_against_drawdown_halt(self):
+        """The 50% premium budget is sized for DEEP-ITM options, which retain
+        intrinsic value: a 0.75-delta call needs the underlying to fall through
+        its strike (~10-15% below spot) before premium goes to zero, so a
+        severe adverse move costs roughly HALF the premium, not all of it.
+        That severe case must stay inside the drawdown halt — and a total
+        wipeout must still leave the account alive."""
+        lim = RiskLimits.explosive()
+        severe_itm_loss = 0.5           # fraction of premium lost in a bad move
+        assert (lim.max_long_option_premium_pct * severe_itm_loss
+                <= lim.max_drawdown_halt_pct)
+        assert lim.max_long_option_premium_pct <= 0.60   # hard ceiling
+        assert lim.max_long_option_premium_pct >= 0.30   # still aggressive

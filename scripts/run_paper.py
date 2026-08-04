@@ -94,8 +94,14 @@ def build_platform():
             # top_n=3 + 0.65 delta: concentrate the sleeve's capital so it can
             # always afford whole contracts (5 names x deep-ITM premium
             # exceeded the sleeve's budget and produced near-zero trades)
-            MomentumStrategy(top_n=3, deploy_fraction=1.0, max_name_weight=0.45,
-                             express_via="options", option_delta=0.65),
+            # Heavy deep-ITM deployment: 0.65-delta calls behave like leveraged
+            # stock with a capped downside, and they are the ONLY long-option
+            # expression the 2023-25 evidence supports. Portfolio premium at
+            # risk is bounded by RiskLimits.max_long_option_premium_pct.
+            MomentumStrategy(top_n=5, deploy_fraction=1.0, max_name_weight=0.45,
+                             express_via="options", option_delta=0.75,
+                             option_leverage=5.0,
+                             option_max_premium_weight=0.70),
             # Equity momentum LAST: it is the single best OOS-validated engine
             # in the platform (2023-25 walk-forward Sharpe 1.47) and lifts
             # portfolio OOS from ~-0.3 to ~+1.1. Deliberately constrained so it
@@ -131,7 +137,17 @@ def build_platform():
     # min_weight 0.08: an options sleeve starved below one contract's premium
     # can never trade again (2023-25 validation: a 2% floor left momentum with
     # $2k against ~$2.5k deep-ITM calls → 6 trades in 3 years, dead sleeve).
-    allocator = (CapitalAllocator(settings.risk, lookback=30, min_weight=0.08)
+    # Explosive: capital is deliberately concentrated in the ITM-options
+    # engine so ~50% of the portfolio can sit in option premium. Equal
+    # weighting a 4-sleeve book would cap that engine at 25% of equity.
+    # Performance scoring still moves capital away from any sleeve that
+    # stops earning.
+    allocator = (CapitalAllocator(
+                     settings.risk, lookback=30, min_weight=0.08,
+                     base_weights={"momentum": 0.50,        # ITM calls
+                                   "put_income": 0.22,      # collateral-based
+                                   "momentum_equity": 0.18,
+                                   "convexity": 0.10})      # crash hedge
                  if settings.risk_profile == "explosive"
                  else CapitalAllocator(settings.risk))
     runner = LiveRunner(

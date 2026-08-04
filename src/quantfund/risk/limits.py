@@ -283,7 +283,32 @@ class RiskManager:
                 False, f"portfolio vega ${post_vega:,.2f} > "
                        f"{lim.max_vega_pct:.2%} of equity")
 
-        # 9) cash buffer on net-debit orders
+        # 9) TOTAL long-option premium at risk (the portfolio-level version of
+        #    "loss is capped at premium": per-position caps do not stop every
+        #    contract expiring worthless at once)
+        premium_at_risk = 0.0
+        for pos in portfolio.open_positions():
+            if isinstance(pos.instrument, Option) and pos.qty > 0:
+                premium_at_risk += pos.notional
+        added_premium = 0.0
+        for i, leg in enumerate(order.legs):
+            if isinstance(leg.instrument, Option) and leg.side == OrderSide.BUY:
+                pos = portfolio.positions.get(leg.instrument.key)
+                cur = pos.qty if pos else 0.0
+                opening = max(0.0, min(eff_qty[i], cur + eff_qty[i]))
+                added_premium += (opening * leg_prices[i]
+                                  * leg.instrument.multiplier)
+        cap_premium = lim.max_long_option_premium_pct * equity
+        if added_premium > 0 and premium_at_risk + added_premium > cap_premium:
+            return RiskDecision(
+                False,
+                f"long-option premium at risk "
+                f"${premium_at_risk + added_premium:,.0f} > "
+                f"{lim.max_long_option_premium_pct:.0%} of equity "
+                f"(${cap_premium:,.0f}) — total premium that can expire "
+                f"worthless is bounded")
+
+        # 10) cash buffer on net-debit orders
         cash_out = 0.0
         for i, leg in enumerate(order.legs):
             cash_out += leg.side.sign * eff_qty[i] * leg_prices[i] * leg.instrument.multiplier

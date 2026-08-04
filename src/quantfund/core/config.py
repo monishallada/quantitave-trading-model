@@ -77,6 +77,11 @@ class RiskLimits:
     allow_short_equity: bool = False
     min_cash_buffer_pct: float = 0.05       # keep >= 5% equity in cash
     target_portfolio_vol: float = 0.12      # allocator scales deployment to this
+    # TOTAL premium paid for long options, as a fraction of equity. Loss on a
+    # long option is capped at its premium — but that cap is PER POSITION, not
+    # per portfolio: premium that all expires worthless is a 100% loss of every
+    # dollar deployed. This is the one number that bounds the worst case.
+    max_long_option_premium_pct: float = 0.10
 
     @classmethod
     def explosive(cls) -> "RiskLimits":
@@ -109,6 +114,10 @@ class RiskLimits:
             allow_short_equity=True,
             min_cash_buffer_pct=0.02,
             target_portfolio_vol=0.60,      # vol targeting mostly stands aside
+            # 50%: half the book in long option premium. Chosen for DEEP-ITM calls,
+            # which retain intrinsic value when wrong (a 0.75-delta call loses ~30%
+            # on a 5% adverse move, not 100%). This cap would be reckless for OTM.
+            max_long_option_premium_pct=0.50,
         )
 
 

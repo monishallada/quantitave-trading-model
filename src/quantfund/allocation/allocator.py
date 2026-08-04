@@ -18,16 +18,31 @@ class SleevePerf:
 
 
 class CapitalAllocator:
-    def __init__(self, limits: RiskLimits, lookback: int = 60, min_weight: float = 0.05):
+    def __init__(self, limits: RiskLimits, lookback: int = 60,
+                 min_weight: float = 0.05,
+                 base_weights: dict[str, float] | None = None):
+        """``base_weights`` sets the intended capital split BEFORE any live
+        performance history exists (equal-weighting a 4-sleeve book caps the
+        main options engine at 25% of equity, which makes a 50%-in-options
+        target unreachable). Once returns accumulate, performance and
+        correlation scoring blend in and can move capital away from a base
+        weight that isn't earning."""
         self.limits = limits
         self.lookback = lookback
         self.min_weight = min_weight
+        self.base_weights = base_weights or {}
 
     def allocate(self, total_equity: float, sleeves: list[SleevePerf]) -> dict[str, float]:
         if total_equity <= 0 or not sleeves:
             return {s.strategy_id: 0.0 for s in sleeves}
         n = len(sleeves)
-        equal = 1.0 / n
+        if self.base_weights:
+            base = np.array([self.base_weights.get(s.strategy_id, 1.0 / n)
+                             for s in sleeves], dtype=float)
+            base = base / base.sum() if base.sum() > 0 else np.full(n, 1.0 / n)
+        else:
+            base = np.full(n, 1.0 / n)
+        equal = base  # the "no evidence yet" anchor the scores shrink toward
 
         # ── raw risk-adjusted score with shrinkage toward equal weight ────
         scores = np.zeros(n)
@@ -75,7 +90,7 @@ class CapitalAllocator:
 
         # ── floors and caps, then renormalize ────────────────────────────
         cap = self.limits.max_strategy_pct
-        floor = min(self.min_weight, 1.0 / n)
+        floor = min(self.min_weight, float(base.min()))
         weights = np.clip(weights, floor, cap)
         # iterative renormalization under the cap
         for _ in range(10):

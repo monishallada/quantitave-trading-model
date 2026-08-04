@@ -68,3 +68,27 @@ def test_vol_targeting_scales_down_hot_portfolios():
     calm_alloc = alloc([SleevePerf("a", calm), SleevePerf("b", list(calm))])
     assert sum(hot_alloc.values()) < 0.5 * sum(calm_alloc.values())
     assert sum(hot_alloc.values()) >= 0.30 * 0.8 * 100_000 * 0.9  # floor holds
+
+
+def test_base_weights_set_the_no_history_split():
+    """Equal-weighting a 4-sleeve book caps the main options engine at 25% of
+    equity; base weights make a ~50%-in-options target reachable."""
+    sleeves = [SleevePerf(k, []) for k in
+               ("momentum", "put_income", "momentum_equity", "convexity")]
+    a = CapitalAllocator(RiskLimits.explosive(), lookback=30, min_weight=0.08,
+                         base_weights={"momentum": 0.50, "put_income": 0.22,
+                                       "momentum_equity": 0.18, "convexity": 0.10})
+    out = a.allocate(100_000, sleeves)
+    assert out["momentum"] > 2 * out["convexity"]
+    assert out["momentum"] >= 40_000        # the options engine is the core
+    assert sum(out.values()) <= 100_000 + 1e-6
+
+def test_base_weights_still_yield_to_performance():
+    """A base-weighted sleeve that loses money must still lose allocation."""
+    winner = [0.01] * 60
+    loser = [-0.01] * 60
+    a = CapitalAllocator(RiskLimits.explosive(), lookback=30, min_weight=0.05,
+                         base_weights={"momentum": 0.80, "put_income": 0.20})
+    out = a.allocate(100_000, [SleevePerf("momentum", loser),
+                               SleevePerf("put_income", winner)])
+    assert out["put_income"] > out["momentum"]

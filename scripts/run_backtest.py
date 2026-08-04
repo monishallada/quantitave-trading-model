@@ -31,9 +31,11 @@ def strategies_factory(settings, state=None, include_llm=False):
         if settings.risk_profile == "explosive":
             # options-first ordering; mean_reversion dropped (see run_paper.py)
             out = [PutIncomeStrategy(), ConvexMomentumStrategy(calls_enabled=False),  # crash convexity only
-                   MomentumStrategy(top_n=3, deploy_fraction=1.0,
+                   MomentumStrategy(top_n=5, deploy_fraction=1.0,
                                     max_name_weight=0.45,
-                                    express_via="options", option_delta=0.65),
+                                    express_via="options", option_delta=0.75,
+                                    option_leverage=5.0,
+                                    option_max_premium_weight=0.70),
                    # equity momentum last: validated OOS core, constrained
                    MomentumStrategy(top_n=3, deploy_fraction=0.55,
                                     max_name_weight=0.20, express_via="equity",
@@ -113,7 +115,17 @@ def main() -> int:
               f"${settings.llm.daily_budget_usd:.2f}; the backtest stops calling "
               "when the budget is hit.", file=sys.stderr)
 
-    allocator = (CapitalAllocator(settings.risk, lookback=30, min_weight=0.08)
+    # Explosive: capital is deliberately concentrated in the ITM-options
+    # engine so ~50% of the portfolio can sit in option premium. Equal
+    # weighting a 4-sleeve book would cap that engine at 25% of equity.
+    # Performance scoring still moves capital away from any sleeve that
+    # stops earning.
+    allocator = (CapitalAllocator(
+                     settings.risk, lookback=30, min_weight=0.08,
+                     base_weights={"momentum": 0.50,        # ITM calls
+                                   "put_income": 0.22,      # collateral-based
+                                   "momentum_equity": 0.18,
+                                   "convexity": 0.10})      # crash hedge
                  if settings.risk_profile == "explosive"
                  else CapitalAllocator(settings.risk))
     engine = BacktestEngine(
