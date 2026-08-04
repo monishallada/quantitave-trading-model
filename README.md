@@ -18,7 +18,7 @@ costs** against buy-and-hold.
 > precisely so you can *trust the losses*.
 
 ---
-
+# money
 ## Quickstart
 
 ```bash
