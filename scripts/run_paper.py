@@ -81,11 +81,31 @@ def build_platform():
         print("=" * 72, file=sys.stderr)
         state.log_event("warning", "config",
                         "EXPLOSIVE risk profile active — high-variance mode")
+        # OPTIONS-FIRST ordering: the options sleeves claim capital, cash, and
+        # exposure budget BEFORE any equity sleeve can consume it (2026-08-03
+        # incident: equity momentum ate the whole gross-exposure and cash
+        # budget, so every option order was rejected all day).
+        # mean_reversion is intentionally absent here — 2023-25 backtest:
+        # -0.9% full period / +0.1% OOS, i.e. it earned nothing while
+        # consuming equity budget the options sleeves need.
         strategies = [
-            MomentumStrategy(deploy_fraction=1.0, max_name_weight=0.35),
-            MeanReversionStrategy(),
-            ConvexMomentumStrategy(),
             PutIncomeStrategy(),
+            ConvexMomentumStrategy(calls_enabled=False),  # crash convexity only
+            # top_n=3 + 0.65 delta: concentrate the sleeve's capital so it can
+            # always afford whole contracts (5 names x deep-ITM premium
+            # exceeded the sleeve's budget and produced near-zero trades)
+            MomentumStrategy(top_n=3, deploy_fraction=1.0, max_name_weight=0.45,
+                             express_via="options", option_delta=0.65),
+            # Equity momentum LAST: it is the single best OOS-validated engine
+            # in the platform (2023-25 walk-forward Sharpe 1.47) and lifts
+            # portfolio OOS from ~-0.3 to ~+1.1. Deliberately constrained so it
+            # can never repeat the 2026-08-03 budget grab: it is last in the
+            # options-first queue, holds fewer names, and deploys ~half of its
+            # sleeve — the options sleeves always eat first.
+            MomentumStrategy(top_n=3, deploy_fraction=0.55,
+                             max_name_weight=0.20, express_via="equity",
+                             strategy_id="momentum_equity",
+                             name="Momentum (equity core)"),
         ]
     else:
         strategies = [MomentumStrategy(), MeanReversionStrategy(),
@@ -104,7 +124,10 @@ def build_platform():
     kill = KillSwitch(state, broker)
     # explosive: shorter lookback adapts allocations 2x faster; lower floor
     # starves losing sleeves instead of force-feeding them 5%
-    allocator = (CapitalAllocator(settings.risk, lookback=30, min_weight=0.02)
+    # min_weight 0.08: an options sleeve starved below one contract's premium
+    # can never trade again (2023-25 validation: a 2% floor left momentum with
+    # $2k against ~$2.5k deep-ITM calls → 6 trades in 3 years, dead sleeve).
+    allocator = (CapitalAllocator(settings.risk, lookback=30, min_weight=0.08)
                  if settings.risk_profile == "explosive"
                  else CapitalAllocator(settings.risk))
     runner = LiveRunner(

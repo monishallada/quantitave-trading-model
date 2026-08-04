@@ -173,3 +173,32 @@ def test_reconciliation_detects_broker_drift(platform):
     assert result["halted"]
     assert state.breakers["reconciliation"].tripped
     assert "mismatch" in state.breakers["reconciliation"].reason
+
+
+def test_restart_into_existing_positions_does_not_double_count(tmp_path):
+    """Restarting against an account that already holds positions must seed the
+    local book from the broker WITHOUT re-applying the fills that created it —
+    otherwise reconciliation trips on every restart."""
+    settings = Settings(alpaca_paper=True, starting_cash=100_000,
+                        data_dir=tmp_path)
+    settings.rebalance_interval_sec = 1e9      # no new trading this test
+    state = PlatformState(tmp_path / "s.db")
+    provider = SyntheticProvider(seed=42)
+    broker = SimBroker(CostModel(CostConfig()), settings.starting_cash)
+    snap = provider.build_snapshot(["SPY"], as_of=utcnow())
+    broker.set_snapshot(snap)
+
+    # pre-existing position + its fill history, as a real account would have
+    from quantfund.core.instruments import Equity
+    from quantfund.core.orders import OrderSide, single_leg
+    broker.submit_order(single_leg(Equity("SPY"), OrderSide.BUY, 10,
+                                   strategy_id="momentum"))
+    assert broker.get_fills()          # the fill exists in broker history
+
+    runner = LiveRunner(settings=settings, broker=broker, provider=provider,
+                        strategies=[], state=state)
+    result = runner.run_once()
+    broker_qty = {p.instrument.key: p.qty for p in broker.get_positions()}
+    assert runner._local_qty == broker_qty      # seeded, not doubled
+    assert not state.breakers["reconciliation"].tripped
+    assert not result["halted"]

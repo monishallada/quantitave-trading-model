@@ -167,3 +167,22 @@ class TestExplosiveProfile:
         s = load_settings(env_file=None)
         assert s.risk_profile == "conservative"
         assert s.risk.daily_loss_halt_pct == RiskLimits().daily_loss_halt_pct
+
+
+class TestCrashConvexityMode:
+    """calls_enabled=False: puts-only crash hedge (momentum's deep-ITM calls
+    carry the bullish side)."""
+
+    def test_no_calls_when_disabled(self):
+        s = snap({"UP": trending_closes(daily=0.004)}, trend="up")
+        strat = ConvexMomentumStrategy(calls_enabled=False)
+        signals = strat.generate_signals(s, ctx_for())
+        assert not any(x.action == SignalAction.OPEN_LONG for x in signals)
+
+    def test_puts_still_fire_in_stress(self):
+        s = snap({"DOWN": trending_closes(daily=-0.005)}, trend="down")
+        strat = ConvexMomentumStrategy(calls_enabled=False)
+        opens = [x for x in strat.generate_signals(s, ctx_for())
+                 if x.action == SignalAction.OPEN_LONG]
+        assert len(opens) == 1
+        assert opens[0].instrument.right == OptionRight.PUT

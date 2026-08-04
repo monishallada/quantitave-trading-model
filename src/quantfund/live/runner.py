@@ -93,6 +93,16 @@ class LiveRunner:
             # config starting_cash is not the account's real equity.
             self._local_qty = {bp.instrument.key: bp.qty for bp in broker_positions}
             self._local_seeded = True
+            # Pre-existing fills are ALREADY reflected in those positions —
+            # mark them seen so _ingest_fills doesn't apply them a second time
+            # (double-counting used to trip the reconciliation breaker on every
+            # restart into a non-empty account).
+            try:
+                for f in self.broker.get_fills(since=None):
+                    self._seen_fills.add((f.order_id, f.instrument.key,
+                                          f.side.value, f.qty, f.ts.isoformat()))
+            except BrokerError as e:
+                self.breakers.record_error("broker.get_fills(seed)", str(e))
             fresh.starting_equity = account.equity
             fresh.peak_equity = account.equity
         self.portfolio = fresh
@@ -129,6 +139,11 @@ class LiveRunner:
         pos = sleeve.positions.get(inst.key)
         current = (pos.qty * price * mult) if pos else 0.0
         delta = target_dollars - current
+        # No-trade band: ignore drift under 25% of target. Without this the
+        # sleeve re-trades on every 15-min rebalance as ranks/vols wobble
+        # (2026-08-03: 85 equity trades in one session, all friction).
+        if current != 0.0 and abs(delta) < 0.25 * abs(target_dollars):
+            return None
         qty = int(abs(delta) / (price * mult))
         if qty < 1:
             return None

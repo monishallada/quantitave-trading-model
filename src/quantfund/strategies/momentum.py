@@ -1,19 +1,27 @@
-"""Cross-sectional momentum sleeve, upgraded:
+"""Cross-sectional momentum sleeve:
 
 - 12-1 style scoring (126-bar return, skipping the last 5 bars).
 - ABSOLUTE momentum filter: only names whose own score is positive are held —
   in a broad downtrend the sleeve goes to cash rather than buying the
   "least bad" losers (dual-momentum evidence: cuts deep drawdowns).
 - Inverse-volatility position sizing: each name's weight scales with the
-  inverse of its 20-bar realized vol, normalized across the book
-  (vol-managed sizing improves risk-adjusted returns).
+  inverse of its 20-bar realized vol, normalized across the book.
 - Regime filter: weights halve when the shared trend regime is "down".
+
+``express_via`` selects the INSTRUMENT used to take that exposure:
+  "equity"  — buy shares (conservative default).
+  "options" — STOCK REPLACEMENT: buy deep-ITM (~70-delta) calls 45-90 DTE
+              instead of shares. Same validated signal, ~2-3x the delta per
+              dollar, max loss capped at premium, and far less cash tied up
+              (which leaves room for the cash-secured put sleeve). Deep ITM +
+              long dated is deliberately the LOW-theta way to hold options —
+              this is leverage, not a lottery ticket.
 """
 from __future__ import annotations
 
 import math
 
-from quantfund.core.instruments import Equity
+from quantfund.core.instruments import Equity, Option, OptionRight
 from quantfund.core.snapshot import MarketSnapshot
 from quantfund.strategies.base import Signal, SignalAction, SleeveContext, Strategy
 
@@ -26,12 +34,36 @@ class MomentumStrategy(Strategy):
 
     def __init__(self, top_n: int = 5, deploy_fraction: float = 0.90,
                  max_name_weight: float = 0.25, lookback: int = 126,
-                 skip: int = 5):
+                 skip: int = 5, express_via: str = "equity",
+                 option_delta: float = 0.70, option_min_dte: float = 45,
+                 option_max_dte: float = 90, option_leverage: float = 2.5,
+                 option_max_premium_weight: float = 0.30,
+                 option_roll_dte: float = 21,
+                 strategy_id: str | None = None, name: str | None = None):
+        # instance-level id so equity and options expressions of this signal can
+        # run side by side as separate sleeves (distinct capital + accounting)
+        if strategy_id:
+            self.strategy_id = strategy_id
+        if name:
+            self.name = name
         self.top_n = top_n
         self.deploy_fraction = deploy_fraction
         self.max_name_weight = max_name_weight
         self.lookback = lookback
         self.skip = skip
+        if express_via not in ("equity", "options"):
+            raise ValueError("express_via must be 'equity' or 'options'")
+        self.express_via = express_via
+        self.option_delta = option_delta
+        self.option_min_dte = option_min_dte
+        self.option_max_dte = option_max_dte
+        self.option_leverage = option_leverage
+        self.option_max_premium_weight = option_max_premium_weight
+        self.option_roll_dte = option_roll_dte
+
+    @property
+    def uses_options(self) -> bool:  # type: ignore[override]
+        return self.express_via == "options"
 
     @staticmethod
     def _realized_vol(closes: list[float], window: int = 20) -> float | None:
@@ -50,6 +82,13 @@ class MomentumStrategy(Strategy):
         scores: dict[str, float] = {}
         vols: dict[str, float] = {}
         for sym in snapshot.bars.keys():
+            # In options mode, rank ONLY over names that actually have a chain.
+            # Ranking the full universe and then discarding un-optionable
+            # winners silently starves the sleeve (2023-25 validation: 2 trades
+            # in 3 years because the top ranks were rarely optionable).
+            if self.express_via == "options" and \
+                    snapshot.get_option_chain(sym) is None:
+                continue
             bars = snapshot.get_bars(sym)
             if len(bars) < self.warmup_bars:
                 continue
@@ -89,38 +128,108 @@ class MomentumStrategy(Strategy):
                 weights[sym] = min(w, self.max_name_weight)
 
         signals: list[Signal] = []
-        held = {k for k, p in ctx.positions.items() if p.is_open}
-        for rank, sym in enumerate(top, start=1):
-            signals.append(Signal(
-                instrument=Equity(sym),
-                action=SignalAction.TARGET_WEIGHT,
-                target_weight=weights[sym],
-                rationale=(f"momentum rank {rank}/{self.top_n}: 12-1 "
-                           f"{scores[sym]:+.1%}, vol {vols[sym]:.0%} → "
-                           f"w={weights[sym]:.1%}; {regime_note}"),
-                strategy_id=self.strategy_id,
-                ts=snapshot.as_of,
-                confidence=min(1.0, 0.5 + 0.1 * (self.top_n - rank)),
-                rationale_payload={
-                    "rank": rank, "score": scores[sym], "vol": vols[sym],
-                    "weight": weights[sym], "regime": regime_note,
-                    "universe_scored": len(scores),
-                    "absolute_filter": "score>0 required",
-                },
-            ))
-        for key in held - set(top):
-            pos = ctx.positions[key]
-            if isinstance(pos.instrument, Equity):
+        # exits, keyed by UNDERLYING so option and equity holdings both resolve
+        held_by_underlying: dict[str, list] = {}
+        for key, pos in ctx.positions.items():
+            if pos.is_open:
+                held_by_underlying.setdefault(pos.instrument.underlying, []).append(pos)
+
+        for underlying, positions in held_by_underlying.items():
+            for pos in positions:
+                inst = pos.instrument
+                expiring = (isinstance(inst, Option)
+                            and inst.days_to_expiration(snapshot.as_of)
+                            <= self.option_roll_dte)
+                if underlying in top and not expiring:
+                    continue
+                reason = ("roll: approaching expiry" if expiring and underlying in top
+                          else f"exited momentum top {self.top_n} / 12-1 negative")
                 signals.append(Signal(
-                    instrument=pos.instrument,
+                    instrument=inst,
                     action=SignalAction.CLOSE,
                     target_weight=0.0,
-                    rationale=(f"{key} exited momentum book (out of top "
-                               f"{self.top_n} or 12-1 turned negative)"),
+                    rationale=f"{inst.key} closed — {reason}",
                     strategy_id=self.strategy_id,
                     ts=snapshot.as_of,
                     confidence=0.7,
-                    rationale_payload={"reason": "rank_or_sign_exit",
-                                       "score": scores.get(key)},
+                    rationale_payload={"reason": reason,
+                                       "score": scores.get(underlying)},
                 ))
+
+        for rank, sym in enumerate(top, start=1):
+            base = {
+                "rank": rank, "score": scores[sym], "vol": vols[sym],
+                "regime": regime_note, "universe_scored": len(scores),
+                "absolute_filter": "score>0 required",
+                "express_via": self.express_via,
+            }
+            if self.express_via == "equity":
+                signals.append(Signal(
+                    instrument=Equity(sym),
+                    action=SignalAction.TARGET_WEIGHT,
+                    target_weight=weights[sym],
+                    rationale=(f"momentum rank {rank}/{self.top_n}: 12-1 "
+                               f"{scores[sym]:+.1%}, vol {vols[sym]:.0%} → "
+                               f"w={weights[sym]:.1%}; {regime_note}"),
+                    strategy_id=self.strategy_id, ts=snapshot.as_of,
+                    confidence=min(1.0, 0.5 + 0.1 * (self.top_n - rank)),
+                    rationale_payload={**base, "weight": weights[sym]},
+                ))
+                continue
+
+            # ── stock replacement via deep-ITM calls ─────────────────────
+            chain = snapshot.get_option_chain(sym)
+            if chain is None:
+                continue
+            oq = chain.nearest_delta(OptionRight.CALL, self.option_delta,
+                                     min_dte=self.option_min_dte,
+                                     max_dte=self.option_max_dte)
+            if oq is None or oq.quote.bid <= 0 or oq.quote.ask <= 0:
+                # sparse chain: widen the window rather than skip the name,
+                # but never accept anything shorter than the roll threshold
+                oq = chain.nearest_delta(OptionRight.CALL, self.option_delta,
+                                         min_dte=self.option_roll_dte + 7,
+                                         max_dte=250)
+            if oq is None or oq.quote.bid <= 0 or oq.quote.ask <= 0:
+                continue
+            inst = oq.instrument
+            # skip if this exact contract is already held (avoids churn)
+            if any(p.instrument.key == inst.key
+                   for p in held_by_underlying.get(sym, [])):
+                continue
+            mid = oq.quote.mid
+            spot = chain.underlying_price
+            delta = abs(oq.greeks.delta) if oq.greeks else self.option_delta
+            if mid <= 0 or spot <= 0 or delta <= 0:
+                continue
+            # target DELTA exposure = equity weight x leverage x sleeve capital;
+            # convert to a premium weight the executor can size from
+            target_delta_dollars = (weights[sym] * self.option_leverage
+                                    * ctx.allocated_capital)
+            contracts = target_delta_dollars / (delta * 100.0 * spot)
+            premium_weight = contracts * mid * 100.0 / ctx.allocated_capital
+            premium_weight = min(premium_weight, self.option_max_premium_weight)
+            if premium_weight * ctx.allocated_capital < mid * 100.0:
+                continue  # can't afford even one contract
+            signals.append(Signal(
+                instrument=inst,
+                action=SignalAction.TARGET_WEIGHT,
+                target_weight=premium_weight,
+                rationale=(f"momentum rank {rank}/{self.top_n} via CALL: 12-1 "
+                           f"{scores[sym]:+.1%}, vol {vols[sym]:.0%} → "
+                           f"{inst.strike:g}C "
+                           f"{inst.days_to_expiration(snapshot.as_of):.0f}DTE "
+                           f"delta {delta:.2f} @ ~{mid:.2f} "
+                           f"(stock replacement, {self.option_leverage:.1f}x "
+                           f"target delta, max loss = premium); {regime_note}"),
+                strategy_id=self.strategy_id, ts=snapshot.as_of,
+                confidence=min(1.0, 0.5 + 0.1 * (self.top_n - rank)),
+                rationale_payload={
+                    **base, "equity_weight_equiv": weights[sym],
+                    "premium_weight": premium_weight, "strike": inst.strike,
+                    "delta": delta, "iv": oq.iv, "premium_mid": mid,
+                    "dte": inst.days_to_expiration(snapshot.as_of),
+                    "leverage": self.option_leverage,
+                },
+            ))
         return signals

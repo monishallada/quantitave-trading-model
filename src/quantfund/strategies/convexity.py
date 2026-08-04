@@ -39,6 +39,7 @@ class ConvexMomentumStrategy(Strategy):
 
     def __init__(self, lookback: int = 20, slow_lookback: int = 126,
                  min_abs_score: float = 0.05, slow_min_score: float = 0.10,
+                 calls_enabled: bool = True,
                  target_delta: float = 0.45, min_dte: float = 14,
                  max_dte: float = 35, exposure_weight: float = 0.30,
                  max_premium_fraction: float = 0.50,
@@ -48,6 +49,11 @@ class ConvexMomentumStrategy(Strategy):
         self.slow_lookback = slow_lookback
         self.min_abs_score = min_abs_score
         self.slow_min_score = slow_min_score
+        # calls_enabled=False turns this into a pure CRASH-CONVEXITY sleeve.
+        # 2023-25 validation (5 runs): the OTM-call leg is what bled — the
+        # momentum sleeve's deep-ITM calls express bullish convexity far more
+        # efficiently (low theta), so short-dated calls here are redundant risk.
+        self.calls_enabled = calls_enabled
         self.target_delta = target_delta
         self.min_dte = min_dte
         self.max_dte = max_dte
@@ -149,7 +155,7 @@ class ConvexMomentumStrategy(Strategy):
         ranked = sorted(optionable, key=lambda s: scores[s], reverse=True)
         # CALLS: validated slow momentum + fast confirmation, never in a
         # downtrend regime (2023-25 evidence: unconfirmed calls bleed theta)
-        if trend == "down":
+        if trend == "down" or not self.calls_enabled:
             longs: list[str] = []
         else:
             longs = [s for s in ranked

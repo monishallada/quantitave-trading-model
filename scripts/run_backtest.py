@@ -29,9 +29,16 @@ from quantfund.strategies.put_income import PutIncomeStrategy
 def strategies_factory(settings, state=None, include_llm=False):
     def factory():
         if settings.risk_profile == "explosive":
-            out = [MomentumStrategy(deploy_fraction=1.0, max_name_weight=0.35),
-                   MeanReversionStrategy(), ConvexMomentumStrategy(),
-                   PutIncomeStrategy()]
+            # options-first ordering; mean_reversion dropped (see run_paper.py)
+            out = [PutIncomeStrategy(), ConvexMomentumStrategy(calls_enabled=False),  # crash convexity only
+                   MomentumStrategy(top_n=3, deploy_fraction=1.0,
+                                    max_name_weight=0.45,
+                                    express_via="options", option_delta=0.65),
+                   # equity momentum last: validated OOS core, constrained
+                   MomentumStrategy(top_n=3, deploy_fraction=0.55,
+                                    max_name_weight=0.20, express_via="equity",
+                                    strategy_id="momentum_equity",
+                                    name="Momentum (equity core)")]
         else:
             out = [MomentumStrategy(), MeanReversionStrategy(),
                    PutIncomeStrategy()]
@@ -105,7 +112,7 @@ def main() -> int:
               f"${settings.llm.daily_budget_usd:.2f}; the backtest stops calling "
               "when the budget is hit.", file=sys.stderr)
 
-    allocator = (CapitalAllocator(settings.risk, lookback=30, min_weight=0.02)
+    allocator = (CapitalAllocator(settings.risk, lookback=30, min_weight=0.08)
                  if settings.risk_profile == "explosive"
                  else CapitalAllocator(settings.risk))
     engine = BacktestEngine(
