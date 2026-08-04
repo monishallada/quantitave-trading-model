@@ -17,8 +17,12 @@ DEFAULT_UNIVERSE = [
     "JPM", "V", "UNH", "XOM", "HD", "PG", "COST", "AVGO", "LLY", "AMD", "NFLX",
 ]
 
-# Options are only traded on this (liquid) subset by default.
-DEFAULT_OPTIONS_UNIVERSE = ["SPY", "QQQ", "AAPL", "MSFT", "NVDA", "AMZN", "TSLA"]
+# Options are only traded on this (liquid) subset by default. Mid-priced names
+# matter as much as the megacaps: a cash-secured put on a $700 index ETF ties
+# up $70k of collateral, so on a small account the cheaper strikes are what
+# actually let the income sleeve build more than one position.
+DEFAULT_OPTIONS_UNIVERSE = ["SPY", "QQQ", "AAPL", "MSFT", "NVDA", "AMZN",
+                            "TSLA", "GOOGL", "META", "AMD", "NFLX"]
 
 SECTOR_MAP: dict[str, str] = {
     "SPY": "INDEX", "QQQ": "INDEX",
@@ -85,7 +89,11 @@ class RiskLimits:
         expected value. Never use these numbers with real money.
         """
         return cls(
-            max_position_pct=0.35,
+            # 0.55: ONE deep-ITM index-ETF call carries ~50% of a $100k
+            # account's equity in delta ($0.65 x 100 x $771 SPY). At 0.35 the
+            # sleeve could not hold a single SPY/QQQ contract and sat in cash.
+            # 0.55 admits one contract per index name, not two.
+            max_position_pct=0.55,
             max_sector_pct=0.60,
             max_strategy_pct=0.60,
             max_gross_leverage=2.0,

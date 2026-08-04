@@ -102,8 +102,12 @@ def build_platform():
             # can never repeat the 2026-08-03 budget grab: it is last in the
             # options-first queue, holds fewer names, and deploys ~half of its
             # sleeve — the options sleeves always eat first.
+            # NON-optionable names only: keeps the equity core from taking
+            # duplicate exposure in the same names as the options sleeves and
+            # from eating their per-name / per-sector budget.
             MomentumStrategy(top_n=3, deploy_fraction=0.55,
                              max_name_weight=0.20, express_via="equity",
+                             exclude=settings.options_universe,
                              strategy_id="momentum_equity",
                              name="Momentum (equity core)"),
         ]

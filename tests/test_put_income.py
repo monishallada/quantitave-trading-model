@@ -124,3 +124,36 @@ class TestExits:
         closes = [s for s in signals if s.action == SignalAction.CLOSE]
         assert len(closes) == 1
         assert "time exit" in closes[0].rationale
+
+
+class TestCapitalEfficiency:
+    def test_cheaper_strikes_preferred_first(self):
+        """Cheap underlyings come first so one expensive contract can't lock
+        the whole collateral budget."""
+        s = PutIncomeStrategy()
+        assert s.preferred.index("AMD") < s.preferred.index("SPY")
+        assert s.max_underlyings >= 4
+
+    def test_builds_multiple_positions_from_one_budget(self):
+        """With cheap strikes available the sleeve should open >1 position."""
+        from quantfund.core.snapshot import MarketSnapshot, RegimeState
+        from conftest import make_bars, make_chain, make_quote
+        # two $50 underlyings: each put secures ~$4.5k, so a $22.8k budget
+        # comfortably fits several
+        syms = {"AMD": 50.0, "NVDA": 50.0, "GOOGL": 50.0}
+        bars = {k: make_bars([v] * 60, end_ts=T0) for k, v in syms.items()}
+        quotes = {k: make_quote(v, ts=T0) for k, v in syms.items()}
+        chains = {k: make_chain(k, spot=v, ts=T0,
+                                strikes=(40.0, 45.0, 50.0, 55.0, 60.0),
+                                premium_base=1.5)
+                  for k, v in syms.items()}
+        snap = MarketSnapshot(as_of=T0, bars=bars, quotes=quotes,
+                              option_chains=chains,
+                              regime=RegimeState(as_of=T0, vol_regime="normal",
+                                                 trend_regime="up"))
+        sigs = PutIncomeStrategy(min_annualized_yield=0.02).generate_signals(
+            snap, ctx_for(capital=25_000.0))
+        opens = [x for x in sigs if x.action == SignalAction.OPEN_SHORT]
+        assert len(opens) >= 2, f"only {len(opens)} positions from a $25k sleeve"
+        secured = sum(x.rationale_payload["cash_secured"] for x in opens)
+        assert secured <= 0.90 * 25_000 + 1e-6

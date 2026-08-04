@@ -33,6 +33,7 @@ class CircuitBreakerBoard:
         self._trade_times: list[datetime] = []
         self._bounds_violations: list[datetime] = []
         self._consecutive_errors = 0
+        self._consecutive_transient = 0
         self._last_error = ""
         for name in BREAKER_NAMES:
             state.set_breaker(name, False)
@@ -42,13 +43,21 @@ class CircuitBreakerBoard:
     def record_trade(self, ts: Optional[datetime] = None) -> None:
         self._trade_times.append(ts or utcnow())
 
-    def record_error(self, source: str, msg: str) -> None:
-        self._consecutive_errors += 1
+    def record_error(self, source: str, msg: str, transient: bool = False) -> None:
+        """``transient`` marks connectivity blips (DNS/timeout/reset). Those
+        must not halt trading as fast as logic errors — a dropped wifi packet
+        is not a broken strategy — so they need 3x as many consecutive
+        failures to trip the breaker."""
         self._last_error = f"{source}: {msg}"
+        if transient:
+            self._consecutive_transient += 1
+        else:
+            self._consecutive_errors += 1
         self.state.log_event("error", source, msg)
 
     def record_success(self) -> None:
         self._consecutive_errors = 0
+        self._consecutive_transient = 0
 
     def record_order_bounds_violation(self, reason: str) -> None:
         self._bounds_violations.append(utcnow())
@@ -111,10 +120,12 @@ class CircuitBreakerBoard:
         else:
             judge("data_staleness", False, "")
 
-        # error burst
-        judge("error_burst", self._consecutive_errors >= lim.max_consecutive_errors,
-              f"{self._consecutive_errors} consecutive errors "
-              f"(last: {self._last_error})")
+        # error burst (transient network failures need 3x the count to trip)
+        burst = (self._consecutive_errors >= lim.max_consecutive_errors
+                 or self._consecutive_transient >= 3 * lim.max_consecutive_errors)
+        judge("error_burst", burst,
+              f"{self._consecutive_errors} errors / {self._consecutive_transient} "
+              f"transient (last: {self._last_error})")
 
         # reconciliation: local book vs broker truth
         if broker_positions is not None:

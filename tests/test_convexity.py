@@ -186,3 +186,14 @@ class TestCrashConvexityMode:
                  if x.action == SignalAction.OPEN_LONG]
         assert len(opens) == 1
         assert opens[0].instrument.right == OptionRight.PUT
+
+
+def test_explosive_per_name_cap_admits_one_index_contract():
+    """A single deep-ITM index call (~50% of a $100k account in delta) must
+    fit under the per-name cap, or the options sleeve sits in cash."""
+    lim = RiskLimits.explosive()
+    equity = 100_000.0
+    one_spy_contract_delta = 0.65 * 100 * 771.0   # ~$50k
+    assert one_spy_contract_delta < lim.max_position_pct * equity
+    # but two of the same name must NOT fit
+    assert 2 * one_spy_contract_delta > lim.max_position_pct * equity

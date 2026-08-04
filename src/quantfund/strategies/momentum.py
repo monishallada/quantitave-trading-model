@@ -39,6 +39,8 @@ class MomentumStrategy(Strategy):
                  option_max_dte: float = 90, option_leverage: float = 2.5,
                  option_max_premium_weight: float = 0.30,
                  option_roll_dte: float = 21,
+                 universe: list[str] | None = None,
+                 exclude: list[str] | None = None,
                  strategy_id: str | None = None, name: str | None = None):
         # instance-level id so equity and options expressions of this signal can
         # run side by side as separate sleeves (distinct capital + accounting)
@@ -60,6 +62,13 @@ class MomentumStrategy(Strategy):
         self.option_leverage = option_leverage
         self.option_max_premium_weight = option_max_premium_weight
         self.option_roll_dte = option_roll_dte
+        # Universe control: when an equity and an options expression of this
+        # signal run side by side they otherwise rank the SAME names, take
+        # duplicate exposure, and the equity sleeve eats the shared per-name
+        # and per-sector budget the options sleeve needs (2026-08-04: options
+        # momentum rejected for "sector TECH > 60%" caused by equity holdings).
+        self.universe = set(universe) if universe else None
+        self.exclude = set(exclude) if exclude else set()
 
     @property
     def uses_options(self) -> bool:  # type: ignore[override]
@@ -82,6 +91,10 @@ class MomentumStrategy(Strategy):
         scores: dict[str, float] = {}
         vols: dict[str, float] = {}
         for sym in snapshot.bars.keys():
+            if self.universe is not None and sym not in self.universe:
+                continue
+            if sym in self.exclude:
+                continue
             # In options mode, rank ONLY over names that actually have a chain.
             # Ranking the full universe and then discarding un-optionable
             # winners silently starves the sleeve (2023-25 validation: 2 trades
@@ -206,11 +219,18 @@ class MomentumStrategy(Strategy):
             # convert to a premium weight the executor can size from
             target_delta_dollars = (weights[sym] * self.option_leverage
                                     * ctx.allocated_capital)
-            contracts = target_delta_dollars / (delta * 100.0 * spot)
-            premium_weight = contracts * mid * 100.0 / ctx.allocated_capital
-            premium_weight = min(premium_weight, self.option_max_premium_weight)
-            if premium_weight * ctx.allocated_capital < mid * 100.0:
-                continue  # can't afford even one contract
+            # Options trade in WHOLE contracts. Round the delta-based size up to
+            # 1 whole contract when affordable — fractional sizing on expensive
+            # underlyings (a 0.4-contract target on $771 SPY) otherwise floors
+            # to zero in the executor and the sleeve never trades.
+            contracts = max(1, int(target_delta_dollars / (delta * 100.0 * spot)))
+            premium_cap = self.option_max_premium_weight * ctx.allocated_capital
+            while contracts > 1 and contracts * mid * 100.0 > premium_cap:
+                contracts -= 1
+            premium_cost = contracts * mid * 100.0
+            if premium_cost > premium_cap:
+                continue  # even one contract exceeds the sleeve's premium cap
+            premium_weight = premium_cost * 1.001 / ctx.allocated_capital
             signals.append(Signal(
                 instrument=inst,
                 action=SignalAction.TARGET_WEIGHT,

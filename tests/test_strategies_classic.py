@@ -285,3 +285,20 @@ class TestMomentumOptionsMode:
         assert eq.strategy_id == "momentum_equity"
         assert eq.name == "Momentum (equity core)"
         assert MomentumStrategy.strategy_id == "momentum"  # class default intact
+
+    def test_universe_and_exclude_filters(self):
+        """Equity core must not compete with the options sleeve for names."""
+        snap = snapshot_with({
+            "AAPL": wiggly_series(drift=0.006),   # optionable, best momentum
+            "JPM": wiggly_series(drift=0.003),    # non-optionable
+        })
+        eq = MomentumStrategy(top_n=2, exclude=["AAPL"],
+                              strategy_id="momentum_equity")
+        picks = {s.instrument.symbol for s in eq.generate_signals(snap, ctx_for("m"))
+                 if s.action == SignalAction.TARGET_WEIGHT}
+        assert picks == {"JPM"}
+        restricted = MomentumStrategy(top_n=2, universe=["AAPL"])
+        picks2 = {s.instrument.symbol
+                  for s in restricted.generate_signals(snap, ctx_for("m"))
+                  if s.action == SignalAction.TARGET_WEIGHT}
+        assert picks2 == {"AAPL"}

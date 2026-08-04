@@ -31,7 +31,7 @@ class PutIncomeStrategy(Strategy):
                  max_dte: float = 45, exit_dte: float = 7,
                  profit_take: float = 0.50, loss_stop_mult: float = 2.5,
                  min_annualized_yield: float = 0.08,
-                 secured_cash_fraction: float = 0.90, max_underlyings: int = 2,
+                 secured_cash_fraction: float = 0.90, max_underlyings: int = 4,
                  preferred: list[str] | None = None):
         self.target_delta = target_delta
         self.min_dte = min_dte
@@ -42,10 +42,13 @@ class PutIncomeStrategy(Strategy):
         self.min_annualized_yield = min_annualized_yield
         self.secured_cash_fraction = secured_cash_fraction
         self.max_underlyings = max_underlyings
-        # index ETFs first; on small accounts their strikes exceed the secured-
-        # cash budget and the loop naturally falls through to cheaper megacaps
-        self.preferred = preferred or ["SPY", "QQQ", "AAPL", "MSFT", "NVDA",
-                                       "AMZN", "TSLA"]
+        # Cheaper strikes FIRST: a cash-secured put on a $700 index ETF locks
+        # $70k of collateral for one contract, which on a small account starves
+        # every later name. Mid-priced underlyings let the sleeve build several
+        # positions from the same budget.
+        self.preferred = preferred or ["AMD", "NVDA", "GOOGL", "AMZN", "META",
+                                       "AAPL", "NFLX", "MSFT", "TSLA",
+                                       "QQQ", "SPY"]
 
     # ── exits ────────────────────────────────────────────────────────────
 

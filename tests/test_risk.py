@@ -302,3 +302,32 @@ class TestNakedShortNetCoverage:
         ])
         d = rm.check_order(order, p, snap)
         assert not d.approved and "undefined-risk" in d.reason
+
+
+class TestTransientErrors:
+    def test_network_blips_need_3x_to_trip(self, tmp_path, snap):
+        state = PlatformState(tmp_path / "t.db")
+        b = CircuitBreakerBoard(RiskLimits(), state)
+        p = Portfolio(cash=100_000)
+        limit = RiskLimits().max_consecutive_errors
+        for _ in range(limit):          # would trip if counted as real errors
+            b.record_error("runner", "ConnectionError(...)", transient=True)
+        assert not any(t.name == "error_burst" for t in b.check_all(p, snap, None))
+        for _ in range(2 * limit):      # sustained outage still trips
+            b.record_error("runner", "ConnectionError(...)", transient=True)
+        assert any(t.name == "error_burst" for t in b.check_all(p, snap, None))
+
+    def test_real_errors_still_trip_fast(self, tmp_path, snap):
+        state = PlatformState(tmp_path / "t2.db")
+        b = CircuitBreakerBoard(RiskLimits(), state)
+        p = Portfolio(cash=100_000)
+        for _ in range(RiskLimits().max_consecutive_errors):
+            b.record_error("strategy", "ValueError: bad math")
+        assert any(t.name == "error_burst" for t in b.check_all(p, snap, None))
+
+    def test_transient_classifier(self):
+        from quantfund.live.runner import _is_transient
+        assert _is_transient(ConnectionError("Max retries exceeded"))
+        assert _is_transient(RuntimeError("Remote end closed connection"))
+        assert not _is_transient(ValueError("target_weight must be within [-1, 1]"))
+        assert not _is_transient(KeyError("momentum"))

@@ -24,6 +24,22 @@ from quantfund.strategies.base import Signal, SignalAction, SleeveContext, Strat
 
 log = logging.getLogger(__name__)
 
+_TRANSIENT_MARKERS = (
+    "connectionerror", "maxretryerror", "nameresolutionerror", "timeout",
+    "remotedisconnected", "remote end closed", "connection aborted",
+    "connection reset", "connection refused", "network is unreachable",
+    "temporary failure in name resolution", "ssl", "read timed out",
+    "502", "503", "504",
+)
+
+
+def _is_transient(exc: BaseException) -> bool:
+    """Network/connectivity blip rather than a logic fault. These must not
+    halt trading at the same rate as real errors (2026-08-04: a wifi drop
+    produced 13 consecutive ConnectionErrors and tripped error_burst)."""
+    text = f"{type(exc).__name__} {exc}".lower()
+    return any(m in text for m in _TRANSIENT_MARKERS)
+
 
 class LiveRunner:
     def __init__(self, settings: Settings, broker: Broker, provider: DataProvider,
@@ -280,8 +296,11 @@ class LiveRunner:
                 self.portfolio.day_anchor_equity = None
 
             # 1. snapshot
+            # as_of=None => LIVE mode: the provider stamps the snapshot after
+            # collection so freshly-arrived quotes/chains aren't discarded as
+            # "future data" (that emptied the option chains on 2026-08-04)
             snapshot = self.provider.build_snapshot(
-                self.settings.universe, as_of=utcnow(),
+                self.settings.universe, as_of=None,
                 options_underlyings=self.settings.options_universe,
             )
             result["snapshot_ts"] = snapshot.as_of.isoformat()
@@ -417,7 +436,8 @@ class LiveRunner:
             return result
         except Exception as e:  # noqa: BLE001 — the loop must survive anything
             log.exception("run_once iteration failed")
-            self.breakers.record_error("runner", repr(e))
+            self.breakers.record_error("runner", repr(e),
+                                       transient=_is_transient(e))
             return result
 
     def run_forever(self, stop_event: threading.Event) -> None:

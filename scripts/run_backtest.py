@@ -37,6 +37,7 @@ def strategies_factory(settings, state=None, include_llm=False):
                    # equity momentum last: validated OOS core, constrained
                    MomentumStrategy(top_n=3, deploy_fraction=0.55,
                                     max_name_weight=0.20, express_via="equity",
+                                    exclude=settings.options_universe,
                                     strategy_id="momentum_equity",
                                     name="Momentum (equity core)")]
         else:
