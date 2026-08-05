@@ -140,3 +140,16 @@ class TestPartialBarExclusion:
         bars = p.get_bars("SPY", datetime(2024, 6, 1, tzinfo=UTC),
                           datetime(2024, 6, 4, tzinfo=UTC))
         assert [b.ts.date() for b in bars] == [today]
+
+
+def test_synthetic_history_reaches_today():
+    """A hardcoded history_end goes stale as real time advances and trips the
+    data_staleness breaker in every offline run."""
+    from datetime import datetime, timezone, timedelta
+    from quantfund.data.synthetic import SyntheticProvider
+    p = SyntheticProvider(seed=42)
+    now = datetime.now(timezone.utc)
+    bars = p.get_bars("SPY", now - timedelta(days=30), now)
+    assert bars, "no recent synthetic bars"
+    age_days = (now - bars[-1].ts).total_seconds() / 86400
+    assert age_days < 4.5, f"newest synthetic bar is {age_days:.1f} days old"

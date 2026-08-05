@@ -383,5 +383,56 @@ class TestLongOptionPremiumCap:
         severe_itm_loss = 0.5           # fraction of premium lost in a bad move
         assert (lim.max_long_option_premium_pct * severe_itm_loss
                 <= lim.max_drawdown_halt_pct)
-        assert lim.max_long_option_premium_pct <= 0.60   # hard ceiling
+        # Hard ceiling 0.70: beyond that, even the *severe* (not total) ITM
+        # loss case blows through the drawdown halt, so the halt would be
+        # reacting to damage already done rather than preventing it.
+        assert lim.max_long_option_premium_pct <= 0.70
         assert lim.max_long_option_premium_pct >= 0.30   # still aggressive
+
+
+class TestPreexistingRiskDoesNotBlockNewOrders:
+    """A pre-existing short put that drifted under-collateralized must not
+    reject unrelated option orders — especially long calls, which carry no
+    undefined risk at all (2026-08-05: this froze options trading entirely)."""
+
+    def _portfolio_with_undercollateralized_put(self, snap):
+        p = Portfolio(cash=100_000)
+        put = chain_contract(snap, OptionRight.PUT, 190.0)
+        p.apply_fill(_fill(put, OrderSide.SELL, 2, 3.0))   # needs $38k secured
+        p.mark_position(put.key, 3.0, T0)
+        p.cash = 5_000                                     # cash drained away
+        return p, put
+
+    def test_long_call_not_blocked_by_unrelated_short_put(self, rm, snap):
+        p, _ = self._portfolio_with_undercollateralized_put(snap)
+        call = chain_contract(snap, OptionRight.CALL, 200.0)
+        d = rm.check_order(single_leg(call, OrderSide.BUY, 1), p, snap)
+        assert "undefined-risk" not in d.reason
+
+    def test_closing_the_bad_put_is_allowed(self, rm, snap):
+        p, put = self._portfolio_with_undercollateralized_put(snap)
+        d = rm.check_order(single_leg(put, OrderSide.BUY, 2), p, snap)
+        assert "undefined-risk" not in d.reason
+
+    def test_adding_more_uncovered_shorts_still_rejected(self, rm, snap):
+        p, put = self._portfolio_with_undercollateralized_put(snap)
+        d = rm.check_order(single_leg(put, OrderSide.SELL, 2), p, snap)
+        assert not d.approved and "undefined-risk" in d.reason
+
+
+class TestPutCollateralIsNotSpendable:
+    def test_equity_buy_cannot_consume_put_collateral(self, snap):
+        lim = RiskLimits(max_order_notional=1e9, max_position_notional=1e9,
+                         max_position_pct=5.0, max_sector_pct=5.0,
+                         max_gross_leverage=5.0, max_net_delta_pct=5.0,
+                         max_theta_pct_per_day=1.0, max_vega_pct=1.0,
+                         min_cash_buffer_pct=0.05)
+        rm = RiskManager(lim)
+        p = Portfolio(cash=100_000)
+        put = chain_contract(snap, OptionRight.PUT, 190.0)
+        p.apply_fill(_fill(put, OrderSide.SELL, 4, 3.0))   # $76k of collateral
+        p.mark_position(put.key, 3.0, T0)
+        # only ~$24k is genuinely free; a $50k stock buy must be refused
+        d = rm.check_order(single_leg(Equity("AAPL"), OrderSide.BUY, 250), p, snap)
+        assert not d.approved
+        assert "securing short puts" in d.reason

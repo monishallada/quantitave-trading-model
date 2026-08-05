@@ -94,12 +94,17 @@ class RiskLimits:
         expected value. Never use these numbers with real money.
         """
         return cls(
-            # 0.55: ONE deep-ITM index-ETF call carries ~50% of a $100k
+            # 0.70 / 0.80: the momentum universe is tech-heavy and ONE
+            # deep-ITM index call is ~50% of a $100k account's equity, so
+            # tighter caps rejected the fills outright. Concentration risk
+            # is accepted here deliberately; the drawdown halt is the
+            # backstop.
+            # (was 0.55: ONE deep-ITM index-ETF call carries ~50% of a $100k
             # account's equity in delta ($0.65 x 100 x $771 SPY). At 0.35 the
             # sleeve could not hold a single SPY/QQQ contract and sat in cash.
             # 0.55 admits one contract per index name, not two.
-            max_position_pct=0.55,
-            max_sector_pct=0.60,
+            max_position_pct=0.70,
+            max_sector_pct=0.80,
             max_strategy_pct=0.60,
             max_gross_leverage=2.0,
             max_net_delta_pct=3.0,          # options delta may exceed equity
@@ -117,7 +122,7 @@ class RiskLimits:
             # 50%: half the book in long option premium. Chosen for DEEP-ITM calls,
             # which retain intrinsic value when wrong (a 0.75-delta call loses ~30%
             # on a 5% adverse move, not 100%). This cap would be reckless for OTM.
-            max_long_option_premium_pct=0.50,
+            max_long_option_premium_pct=0.65,
         )
 
 

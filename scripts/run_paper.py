@@ -147,9 +147,14 @@ def build_platform():
     allocator = (CapitalAllocator(
                      settings.risk, lookback=30, min_weight=0.08,
                      base_weights={"momentum": 0.50,        # ITM calls
-                                   "put_income": 0.22,      # collateral-based
-                                   "momentum_equity": 0.18,
-                                   "convexity": 0.10})      # crash hedge
+                                   "put_income": 0.25,      # short puts
+                                   "convexity": 0.05,       # crash hedge
+                                   "momentum_equity": 0.20})
+                     # 80% of capital to the three OPTIONS sleeves;
+                     # convexity trimmed to 5% (6 straight negative
+                     # OOS validations) in favour of the two validated
+                     # engines. momentum_equity keeps 20% because it is
+                     # the strongest OOS sleeve in the platform.
                  if settings.risk_profile == "explosive"
                  else CapitalAllocator(settings.risk))
     runner = LiveRunner(

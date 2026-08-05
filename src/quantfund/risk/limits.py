@@ -67,40 +67,63 @@ class RiskManager:
         (puts); both are CONSUMED across groups, never double-counted.
         Returns a rejection reason, or None if no undefined risk remains.
         """
-        projected: dict[str, tuple[Option, float]] = {}
-        for key, pos in portfolio.positions.items():
-            if isinstance(pos.instrument, Option) and pos.is_open:
-                projected[key] = (pos.instrument, pos.qty)
-        touched = False
-        for leg in order.legs:
-            if not isinstance(leg.instrument, Option):
-                continue
-            touched = True
-            inst = leg.instrument
-            _, qty = projected.get(inst.key, (inst, 0.0))
-            projected[inst.key] = (inst, qty + leg.side.sign * leg.qty)
-        if not touched:
+        def uncovered_by_group(with_order: bool) -> dict[tuple, float]:
+            book: dict[str, tuple[Option, float]] = {}
+            for key, pos in portfolio.positions.items():
+                if isinstance(pos.instrument, Option) and pos.is_open:
+                    book[key] = (pos.instrument, pos.qty)
+            if with_order:
+                for leg in order.legs:
+                    if not isinstance(leg.instrument, Option):
+                        continue
+                    inst = leg.instrument
+                    _, qty = book.get(inst.key, (inst, 0.0))
+                    book[inst.key] = (inst, qty + leg.side.sign * leg.qty)
+            groups: dict[tuple, list[tuple[Option, float]]] = {}
+            for inst, qty in book.values():
+                k = (inst.underlying_symbol, inst.right, inst.expiration)
+                groups.setdefault(k, []).append((inst, qty))
+            out: dict[tuple, float] = {}
+            for k, contracts in groups.items():
+                longs = sum(q for _, q in contracts if q > 0)
+                shorts = -sum(q for _, q in contracts if q < 0)
+                out[k] = max(0.0, shorts - longs)
+            return out
+
+        touched_groups = {
+            (leg.instrument.underlying_symbol, leg.instrument.right,
+             leg.instrument.expiration)
+            for leg in order.legs if isinstance(leg.instrument, Option)
+        }
+        if not touched_groups:
             return None
 
-        groups: dict[tuple, list[tuple[Option, float]]] = {}
-        for inst, qty in projected.values():
-            k = (inst.underlying_symbol, inst.right, inst.expiration)
-            groups.setdefault(k, []).append((inst, qty))
+        before = uncovered_by_group(with_order=False)
+        after = uncovered_by_group(with_order=True)
 
+        # Only judge groups THIS ORDER touches, and only reject when the order
+        # INCREASES uncovered short exposure. Evaluating the whole book meant a
+        # single pre-existing short put that drifted under-collateralized
+        # rejected every unrelated option order in the platform — including
+        # long calls, which carry no undefined risk at all (2026-08-05).
         shares_available: dict[str, float] = {}
         cash_available = portfolio.cash
-        for (underlying, right, expiration), contracts in sorted(
-                groups.items(), key=lambda kv: str(kv[0])):
-            longs = sum(q for _, q in contracts if q > 0)
-            shorts = -sum(q for _, q in contracts if q < 0)
-            uncovered = shorts - longs
-            if uncovered <= 1e-9:
+        for key in sorted(touched_groups, key=str):
+            underlying, right, expiration = key
+            new_uncovered = after.get(key, 0.0)
+            old_uncovered = before.get(key, 0.0)
+            # Allow only orders that leave the group covered, or that strictly
+            # REDUCE its uncovered shorts. A long call touches a group with no
+            # shorts (uncovered 0) and always passes; closing a bad short
+            # passes because it reduces; rolling into an equally-naked short
+            # does not.
+            if new_uncovered <= 1e-9 or new_uncovered < old_uncovered - 1e-9:
                 continue
             if right == OptionRight.CALL:
                 if underlying not in shares_available:
                     pos = portfolio.positions.get(underlying)
                     shares_available[underlying] = pos.qty if pos else 0.0
-                need = 100.0 * uncovered
+                need = 100.0 * new_uncovered
                 if shares_available[underlying] + 1e-9 >= need:
                     shares_available[underlying] -= need  # consumed
                     continue
@@ -108,9 +131,23 @@ class RiskManager:
                         f"{need:.0f} shares, have "
                         f"{shares_available[underlying]:.0f} uncommitted")
             else:
-                # conservative reserve: max strike among net-short puts
-                short_strikes = [inst.strike for inst, q in contracts if q < 0]
-                reserve = max(short_strikes) * 100.0 * uncovered
+                contracts = [
+                    (pos.instrument, pos.qty)
+                    for pos in portfolio.positions.values()
+                    if isinstance(pos.instrument, Option)
+                    and (pos.instrument.underlying_symbol, pos.instrument.right,
+                         pos.instrument.expiration) == key
+                ] + [
+                    (leg.instrument, -leg.qty) for leg in order.legs
+                    if isinstance(leg.instrument, Option)
+                    and leg.side == OrderSide.SELL
+                    and (leg.instrument.underlying_symbol, leg.instrument.right,
+                         leg.instrument.expiration) == key
+                ]
+                short_strikes = [i.strike for i, q in contracts if q < 0]
+                if not short_strikes:
+                    continue
+                reserve = max(short_strikes) * 100.0 * new_uncovered
                 if cash_available + 1e-9 >= reserve:
                     cash_available -= reserve  # consumed
                     continue
@@ -308,16 +345,29 @@ class RiskManager:
                 f"(${cap_premium:,.0f}) — total premium that can expire "
                 f"worthless is bounded")
 
-        # 10) cash buffer on net-debit orders
+        # 10) cash buffer on net-debit orders — measured against UNCOMMITTED
+        #     cash. Cash securing existing short puts is collateral, not
+        #     spendable: letting an equity buy consume it silently
+        #     under-collateralizes the put book (2026-08-05: stock purchases
+        #     drained cash below the NVDA put reserve and froze options
+        #     trading platform-wide).
+        committed_cash = 0.0
+        for pos in portfolio.open_positions():
+            inst = pos.instrument
+            if (isinstance(inst, Option) and inst.right == OptionRight.PUT
+                    and pos.qty < 0):
+                committed_cash += inst.strike * 100.0 * abs(pos.qty)
         cash_out = 0.0
         for i, leg in enumerate(order.legs):
             cash_out += leg.side.sign * eff_qty[i] * leg_prices[i] * leg.instrument.multiplier
         if cash_out > 0:
-            post_cash = portfolio.cash - cash_out
+            post_cash = portfolio.cash - committed_cash - cash_out
             if post_cash < lim.min_cash_buffer_pct * equity:
                 return RiskDecision(
-                    False, f"cash buffer: post-trade cash ${post_cash:,.0f} < "
-                           f"{lim.min_cash_buffer_pct:.0%} of equity")
+                    False, f"cash buffer: post-trade uncommitted cash "
+                           f"${post_cash:,.0f} < {lim.min_cash_buffer_pct:.0%} "
+                           f"of equity (${committed_cash:,.0f} is securing "
+                           f"short puts)")
 
         if adjusted_qty is not None:
             return RiskDecision(True, "downsized to per-order notional limit",
