@@ -373,21 +373,33 @@ class TestLongOptionPremiumCap:
         assert not d.approved and "premium at risk" in d.reason
 
     def test_explosive_cap_reasoned_against_drawdown_halt(self):
-        """The 50% premium budget is sized for DEEP-ITM options, which retain
-        intrinsic value: a 0.75-delta call needs the underlying to fall through
-        its strike (~10-15% below spot) before premium goes to zero, so a
-        severe adverse move costs roughly HALF the premium, not all of it.
-        That severe case must stay inside the drawdown halt — and a total
-        wipeout must still leave the account alive."""
+        """Two different loss shapes have to stay survivable.
+
+        DEEP-ITM longs retain intrinsic value: a 0.75-delta call needs the
+        underlying through its strike before premium goes to zero, so a severe
+        adverse move costs roughly HALF the premium. That severe case must
+        land inside the drawdown halt, or the halt is reacting to damage
+        already done rather than preventing it.
+
+        CAPPED-LOSS longs (0DTE, far OTM) go to zero routinely, so the premium
+        cap alone does not bound them — the DAILY loss halt does, and it must
+        fire before a wipeout day can approach the drawdown halt.
+        """
         lim = RiskLimits.explosive()
         severe_itm_loss = 0.5           # fraction of premium lost in a bad move
         assert (lim.max_long_option_premium_pct * severe_itm_loss
-                <= lim.max_drawdown_halt_pct)
-        # Hard ceiling 0.70: beyond that, even the *severe* (not total) ITM
-        # loss case blows through the drawdown halt, so the halt would be
-        # reacting to damage already done rather than preventing it.
-        assert lim.max_long_option_premium_pct <= 0.70
-        assert lim.max_long_option_premium_pct >= 0.30   # still aggressive
+                <= lim.max_drawdown_halt_pct), (
+            "a severe ITM move alone would blow through the drawdown halt")
+        # derived, not hardcoded: cap * severe_loss <= drawdown_halt
+        assert lim.max_long_option_premium_pct <= 2.0 * lim.max_drawdown_halt_pct
+        # a wipeout day must trip the DAILY halt well before the drawdown halt,
+        # otherwise the account can be gutted inside one session
+        assert lim.daily_loss_halt_pct < lim.max_drawdown_halt_pct
+        assert lim.daily_loss_halt_pct <= 0.30, (
+            "beyond -30% in a single day the account cannot recover in any "
+            "reasonable number of sessions")
+        # undefined risk stays banned at every aggression level
+        assert lim.allow_naked_short_options is False
 
 
 class TestPreexistingRiskDoesNotBlockNewOrders:
@@ -436,3 +448,217 @@ class TestPutCollateralIsNotSpendable:
         d = rm.check_order(single_leg(Equity("AAPL"), OrderSide.BUY, 250), p, snap)
         assert not d.approved
         assert "securing short puts" in d.reason
+
+
+def test_gate_and_book_measure_option_exposure_the_same_way():
+    """The gate must authorize using the yardstick the book reports.
+
+    Alpaca serves no greeks on 0DTE contracts. The gate used to fall back to
+    premium while Portfolio fell back to Black-Scholes, so a 21-lot QQQ 0DTE
+    call was authorized as "$1,911 of exposure" and landed on the book as
+    $510,170 — net dollar delta 6.39x equity (observed live 2026-08-07).
+    Whatever rule is chosen, both sides must apply the SAME one.
+    """
+    from datetime import datetime, timezone
+
+    from quantfund.core.instruments import OptionRight, make_option
+    from quantfund.core.orders import Fill, OrderSide, single_leg
+    from quantfund.core.portfolio import Portfolio, Position, option_exposure
+    from quantfund.core.snapshot import (
+        MarketSnapshot, OptionChain, OptionQuote, Quote,
+    )
+    from quantfund.risk.limits import _leg_greeks
+
+    now = datetime(2026, 8, 7, 15, 0, tzinfo=timezone.utc)
+    spot = 721.0
+    inst = make_option("QQQ", now.date(), OptionRight.CALL, 723.0)   # 0DTE
+    # NO greeks and NO iv — exactly what the indicative feed returns on 0DTE
+    oq = OptionQuote(instrument=inst,
+                     quote=Quote(ts=now, bid=0.89, ask=0.95),
+                     iv=None, greeks=None)
+    snap = MarketSnapshot(
+        as_of=now,
+        quotes={"QQQ": Quote(ts=now, bid=spot - 0.01, ask=spot + 0.01)},
+        option_chains={"QQQ": OptionChain(underlying="QQQ", ts=now,
+                                          underlying_price=spot,
+                                          quotes=(oq,))},
+    )
+
+    order = single_leg(inst, OrderSide.BUY, 21.0, strategy_id="zero_dte")
+    g = _leg_greeks(order.legs[0], snap)
+    assert g is not None, "gate must derive greeks when the feed omits them"
+    assert 0.05 < g.delta < 0.95
+
+    gate_expo = option_exposure(
+        qty=21.0, multiplier=100, delta=g.delta,
+        underlying_price=spot, premium=oq.quote.mid)
+
+    pf = Portfolio(cash=100_000.0, starting_equity=100_000.0)
+    pf.apply_fill(Fill(order_id="o", instrument=inst, side=OrderSide.BUY,
+                       qty=21, price=oq.quote.mid, ts=now))
+    pf.mark_from_snapshot(snap)
+    book_expo = pf.exposure_by_underlying()["QQQ"]
+
+    assert gate_expo == pytest.approx(book_expo, rel=1e-6), (
+        f"gate says ${gate_expo:,.0f}, book says ${book_expo:,.0f}")
+    # this contract is a capped-loss ticket, so both measure it by PREMIUM
+    assert book_expo == pytest.approx(oq.quote.mid * 21 * 100, rel=1e-6)
+
+
+def test_deep_itm_long_still_measured_by_delta_notional():
+    """The premium rule must NOT leak to stock-replacement calls. A 0.85-delta
+    call tracks the underlying nearly 1:1; pricing it at premium would hide
+    real leverage behind a small number."""
+    from datetime import date, datetime, timedelta, timezone
+
+    from quantfund.core.greeks import Greeks
+    from quantfund.core.instruments import OptionRight, make_option
+    from quantfund.core.orders import Fill, OrderSide
+    from quantfund.core.portfolio import Portfolio
+
+    now = datetime(2026, 8, 7, 15, 0, tzinfo=timezone.utc)
+    spot = 772.0
+    itm = make_option("SPY", now.date() + timedelta(days=14),
+                      OptionRight.CALL, 758.0)
+    pf = Portfolio(cash=100_000.0, starting_equity=100_000.0)
+    pf.apply_fill(Fill(order_id="o", instrument=itm, side=OrderSide.BUY,
+                       qty=1, price=17.60, ts=now))
+    pos = pf.positions[itm.key]
+    pos.mark, pos.underlying_mark = 17.60, spot
+    pos.greeks = Greeks(delta=0.85, gamma=0.01, theta=-0.5, vega=0.2, rho=0.1)
+
+    expo = pf.exposure_by_underlying()["SPY"]
+    assert expo == pytest.approx(0.85 * 100 * spot), (
+        "deep-ITM long must stay on delta notional")
+    assert expo > 30 * (17.60 * 100)
+
+
+def test_closing_a_long_option_is_never_blocked_by_exposure_caps():
+    """A stop-loss must always be able to execute.
+
+    option_exposure treats qty < 0 as a SHORT POSITION, but a negative ORDER
+    LEG is a SELL — which for a long holding is a CLOSE. Measuring the leg in
+    isolation priced a 21-lot 0DTE stop-loss as opening a $422k short, and the
+    gate rejected it three passes running while the call sat open past its
+    -35% trigger (2026-08-07 16:24-16:27). Exposure change must be measured as
+    post-position minus pre-position.
+    """
+    from datetime import datetime, timezone
+
+    from quantfund.core.config import RiskLimits
+    from quantfund.core.instruments import OptionRight, make_option
+    from quantfund.core.orders import Fill, OrderSide, single_leg
+    from quantfund.core.portfolio import Portfolio
+    from quantfund.core.snapshot import (
+        MarketSnapshot, OptionChain, OptionQuote, Quote,
+    )
+    from quantfund.risk.limits import RiskManager
+
+    now = datetime(2026, 8, 7, 16, 25, tzinfo=timezone.utc)
+    spot = 719.0
+    call = make_option("QQQ", now.date(), OptionRight.CALL, 723.0)
+    oq = OptionQuote(instrument=call,
+                     quote=Quote(ts=now, bid=0.55, ask=0.58),
+                     iv=None, greeks=None)
+    snap = MarketSnapshot(
+        as_of=now,
+        quotes={"QQQ": Quote(ts=now, bid=spot - 0.01, ask=spot + 0.01)},
+        option_chains={"QQQ": OptionChain(underlying="QQQ", ts=now,
+                                          underlying_price=spot,
+                                          quotes=(oq,))},
+    )
+    pf = Portfolio(cash=100_000.0, starting_equity=100_000.0)
+    pf.apply_fill(Fill(order_id="entry", instrument=call, side=OrderSide.BUY,
+                       qty=21, price=0.92, ts=now))
+    pf.mark_from_snapshot(snap)
+
+    rm = RiskManager(RiskLimits.explosive())
+    stop = single_leg(call, OrderSide.SELL, 21.0, strategy_id="zero_dte")
+    decision = rm.check_order(stop, pf, snap)
+    assert decision.approved, f"stop-loss rejected: {decision.reason}"
+
+    # and a partial close is fine too
+    half = single_leg(call, OrderSide.SELL, 10.0, strategy_id="zero_dte")
+    assert rm.check_order(half, pf, snap).approved
+
+
+def test_opening_a_genuine_short_option_still_measured_as_short():
+    """The close fix must not make real shorts look free."""
+    from datetime import datetime, timedelta, timezone
+
+    from quantfund.core.config import RiskLimits
+    from quantfund.core.instruments import OptionRight, make_option
+    from quantfund.core.orders import OrderSide, single_leg
+    from quantfund.core.portfolio import Portfolio
+    from quantfund.core.snapshot import (
+        MarketSnapshot, OptionChain, OptionQuote, Quote,
+    )
+    from quantfund.risk.limits import RiskManager
+
+    now = datetime(2026, 8, 7, 16, 25, tzinfo=timezone.utc)
+    spot = 719.0
+    call = make_option("QQQ", now.date() + timedelta(days=14),
+                       OptionRight.CALL, 700.0)
+    oq = OptionQuote(instrument=call,
+                     quote=Quote(ts=now, bid=25.0, ask=25.4),
+                     iv=None, greeks=None)
+    snap = MarketSnapshot(
+        as_of=now,
+        quotes={"QQQ": Quote(ts=now, bid=spot - 0.01, ask=spot + 0.01)},
+        option_chains={"QQQ": OptionChain(underlying="QQQ", ts=now,
+                                          underlying_price=spot,
+                                          quotes=(oq,))},
+    )
+    pf = Portfolio(cash=100_000.0, starting_equity=100_000.0)
+    rm = RiskManager(RiskLimits.explosive())
+    naked = single_leg(call, OrderSide.SELL, 20.0, strategy_id="x")
+    d = rm.check_order(naked, pf, snap)
+    assert not d.approved, "writing 20 naked calls must not pass the gate"
+
+
+def test_defined_risk_spread_legs_offset_instead_of_reading_as_naked():
+    """The moneyness rule is not additive across spread legs.
+
+    Measuring a long leg by premium while its covering short leg uses full
+    delta notional made a defined-risk vertical read like a large naked short
+    and the gate rejected it. Within a (underlying, right, expiration) group
+    that holds shorts, every leg must use the SAME basis so they offset.
+    """
+    from datetime import datetime, timedelta, timezone
+
+    from quantfund.core.config import RiskLimits
+    from quantfund.core.instruments import OptionRight, make_option
+    from quantfund.core.orders import Order, OrderLeg, OrderSide
+    from quantfund.core.portfolio import Portfolio
+    from quantfund.core.snapshot import (
+        MarketSnapshot, OptionChain, OptionQuote, Quote,
+    )
+    from quantfund.risk.limits import RiskManager
+
+    now = datetime(2026, 8, 10, 15, 0, tzinfo=timezone.utc)
+    exp = now.date() + timedelta(days=14)
+    spot = 200.0
+    lo = make_option("AAPL", exp, OptionRight.CALL, 200.0)
+    hi = make_option("AAPL", exp, OptionRight.CALL, 210.0)
+    chain = OptionChain(
+        underlying="AAPL", ts=now, underlying_price=spot,
+        quotes=(
+            OptionQuote(instrument=lo, quote=Quote(ts=now, bid=8.0, ask=8.2)),
+            OptionQuote(instrument=hi, quote=Quote(ts=now, bid=3.0, ask=3.2)),
+        ))
+    snap = MarketSnapshot(
+        as_of=now, quotes={"AAPL": Quote(ts=now, bid=spot - .01, ask=spot + .01)},
+        option_chains={"AAPL": chain})
+
+    pf = Portfolio(cash=100_000.0, starting_equity=100_000.0)
+    rm = RiskManager(RiskLimits(max_order_notional=1e9))   # conservative caps
+    spread = Order(legs=[
+        OrderLeg(instrument=lo, side=OrderSide.BUY, qty=2),
+        OrderLeg(instrument=hi, side=OrderSide.SELL, qty=2),
+    ])
+    d = rm.check_order(spread, pf, snap)
+    assert d.approved, f"defined-risk vertical rejected: {d.reason}"
+
+    # a NAKED short of the same size must still be refused
+    naked = Order(legs=[OrderLeg(instrument=hi, side=OrderSide.SELL, qty=2)])
+    assert not rm.check_order(naked, pf, snap).approved

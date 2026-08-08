@@ -132,3 +132,61 @@ class TestRiskMetrics:
         p = Portfolio(cash=1_000)
         p.apply_fill(fill(AAPL, OrderSide.BUY, 100, 100.0))  # overdraws in sim
         assert p.buying_power == 0.0
+
+
+def test_option_premium_and_economic_exposure_are_reported_separately():
+    """A deep-ITM call's premium is a small fraction of the stock it controls.
+    Reporting only premium made a ~1x-delta book look 19% deployed, which is
+    how "the portfolio isn't deployed" gets said about a fully-working book.
+    """
+    from datetime import date, timedelta
+
+    from quantfund.core.greeks import Greeks
+    from quantfund.core.instruments import OptionRight, make_option
+    from quantfund.core.orders import Fill, OrderSide
+    from quantfund.core.portfolio import Portfolio
+    from quantfund.core.state import utcnow
+
+    pf = Portfolio(cash=100_000.0)
+    call = make_option("SPY", date.today() + timedelta(days=14),
+                       OptionRight.CALL, 758.0)
+    pf.apply_fill(Fill(order_id="o1", instrument=call, side=OrderSide.BUY,
+                       qty=1, price=17.60, ts=utcnow()))
+    pos = pf.positions[call.key]
+    pos.mark = 17.60
+    pos.greeks = Greeks(delta=0.85, gamma=0.01, theta=-0.5, vega=0.2, rho=0.1)
+    pos.underlying_mark = 772.0
+
+    premium = pf.gross_exposure()
+    economic = pf.gross_delta_exposure()
+    assert premium == pytest.approx(1760.0)              # what can go to zero
+    assert economic == pytest.approx(0.85 * 100 * 772.0)  # what actually moves
+    assert economic > 30 * premium, (
+        "economic exposure must reflect delta notional, not premium")
+
+
+def test_long_option_theta_cannot_exceed_its_premium():
+    """BS theta is an instantaneous rate that explodes into expiry. A 21-lot
+    QQQ 0DTE call holding $1,932 of premium reported -$7,930/day of decay —
+    a loss it cannot possibly realise, which made theta the binding risk limit
+    for a position whose true worst case is the premium (2026-08-07)."""
+    from quantfund.core.portfolio import option_theta_per_day
+
+    premium, qty, mult = 0.92, 21.0, 100
+    max_loss = premium * qty * mult                     # $1,932
+
+    bounded = option_theta_per_day(qty=qty, multiplier=mult,
+                                   theta=-3.78, premium=premium)
+    assert abs(bounded) <= max_loss + 1e-9, (
+        f"theta {bounded:,.0f} exceeds the ${max_loss:,.0f} that can decay")
+    assert bounded == pytest.approx(-max_loss)
+
+    # a normal, far-from-expiry long is untouched
+    mild = option_theta_per_day(qty=1, multiplier=100, theta=-0.05,
+                                premium=17.60)
+    assert mild == pytest.approx(-5.0)
+
+    # SHORT options are not premium-bounded — their risk is unbounded elsewhere
+    short = option_theta_per_day(qty=-6, multiplier=100, theta=-0.02,
+                                 premium=0.91)
+    assert short == pytest.approx(-0.02 * -6 * 100)

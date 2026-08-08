@@ -63,7 +63,8 @@ you can watch the entire platform work before wiring credentials.
 
 | Panel | What you're looking at |
 |---|---|
-| **Header tiles** | Total equity (hero), cash, buying power, day P&L, total P&L (both net of all costs), gross exposure, drawdown, cumulative costs paid. |
+| **Header tiles** | Total equity (hero), cash, buying power, day P&L, total P&L (both net of all costs), **premium at risk**, **economic exposure**, drawdown, cumulative costs paid. |
+| **Premium at risk vs economic exposure** | Two different questions, both shown, because for options they differ by ~35x. *Premium at risk* is what can go to zero (a long option's max loss). *Economic exposure* is delta-adjusted notional — how much market the book actually controls, and what the per-underlying/per-sector risk limits enforce. A single 0.80-delta SPY call is ~$1.8k of premium but ~$65k of exposure; judging deployment by premium alone makes a fully-invested book look 19% deployed. |
 | **Equity & drawdown** | Portfolio equity line with crosshair tooltip; drawdown-from-peak area below it (same time axis). |
 | **Positions** | Every stock and option: qty, avg cost, mark, notional, unrealized P&L; options also show delta/theta and expiry. |
 | **Strategies** | Per sleeve: allocated capital, weight of equity, live P&L, open position count. Colors are fixed per sleeve. |
@@ -82,7 +83,7 @@ you can watch the entire platform work before wiring credentials.
 | `core/portfolio.py` | Unified equity+options accounting: cash, cost basis, realized/unrealized P&L, exposures, **net Greeks** ($ delta, gamma, theta/day, vega). |
 | `core/greeks.py` | Black-Scholes pricing/Greeks/IV (fallback when the chain has no Greeks). |
 | `data/` | `DataProvider` interface; `AlpacaDataProvider` (daily bars IEX + quotes + option chain w/ Greeks + date-pinned news, on-disk bar cache); `SyntheticProvider` (seeded GBM, offline). News that can't be date-pinned is **excluded** from snapshots by construction. |
-| `strategies/` | `Strategy` interface. **`momentum`** — 12-1 cross-sectional, inverse-vol sized, absolute-momentum filtered; expresses via shares OR **deep-ITM calls** (`express_via="options"`, stock replacement). **`put_income`** — volatility-risk-premium: cash-secured ~30-delta puts, min 8% annualized yield, 50% profit-take / time exit / 2.5x loss stop. **`convexity`** — long options for crash/breakout convexity (puts-only by default). **`mean_reversion`** — 5d z-score dip-buying above the 200d SMA. `llm_agents/` (see below). |
+| `strategies/` | `Strategy` interface. **`momentum`** — 12-1 cross-sectional, inverse-vol sized, absolute-momentum filtered; expresses via shares OR **deep-ITM calls** (`express_via="options"`, stock replacement). **`put_income`** — volatility-risk-premium: cash-secured ~30-delta puts, min 8% annualized yield, 50% profit-take / time exit / 2.5x loss stop. **`zero_dte`** — same-session index-ETF options; intraday 1-min signals (15m momentum + session VWAP side + relative-volume surge vs a 30m trailing median), contracts picked by **moneyness** (Alpaca's indicative feed carries no greeks on 0DTE), hard bracket of +60% take-profit / -35% stop / **forced flat at 19:30 UTC** so nothing is ever held into expiry. **Unvalidated — see below.** **`convexity`** — long options for crash/breakout convexity (puts-only; disproven, no longer in the explosive lineup). **`mean_reversion`** — 5d z-score dip-buying above the 200d SMA. `llm_agents/` (see below). |
 | `allocation/allocator.py` | Risk-adjusted (Sharpe, shrunk toward equal weight) with pairwise-correlation penalty; per-sleeve floor 5% / cap 40%; **portfolio vol targeting** — deployment scales down when realized vol exceeds the 12% annual target (floor 30%). |
 | `execution/` | `Broker` interface; `SimBroker` (fills through the cost model); `AlpacaPaperBroker` (alpaca-py, paper-only, single- and multi-leg MLEG option orders, fill/position sync, flatten-all). |
 | `risk/` | `RiskManager` pre-trade gate, `CircuitBreakerBoard` (7 breakers), `KillSwitch`. |
@@ -93,24 +94,76 @@ you can watch the entire platform work before wiring credentials.
 ### Risk profiles (`QF_RISK_PROFILE` in .env)
 
 `conservative` (default) or `explosive`. Explosive is a **high-variance paper-testing**
-configuration: wide limits, options-first sleeve ordering, and up to **50% of equity in
+configuration: wide limits, options-first sleeve ordering, and up to **65% of equity in
 long-option premium**. Undefined-risk (naked short) options stay banned in both.
 
 | Limit | conservative | explosive |
 |---|---|---|
-| Per-underlying exposure | 10% | 55% |
-| Per-sector | 25% | 60% |
-| Gross leverage | 1.0x | 2.0x |
+| Per-underlying exposure | 10% | 70% |
+| Per-sector | 25% | 80% |
+| Gross leverage *(premium basis)* | 1.0x | 2.0x |
 | \|Net $ delta\| | 80% | 300% |
-| **Long-option premium at risk** | **10%** | **50%** |
+| **Long-option premium at risk** | **10%** | **65%** |
 | Daily loss halt (flattens) | -2% | -15% |
 | Max drawdown halt | -10% | -40% |
 | Short equity | banned | allowed |
+| Naked short options | banned | **banned** |
+
+### How option exposure is measured (and why it is not one rule)
+
+Every risk check that talks about "exposure" goes through a single function,
+`portfolio.option_exposure` — used by **both** `Portfolio.exposure_by_underlying`
+and the pre-trade risk gate. They must agree: when the gate sized 0DTE by premium
+while the book marked it by Black-Scholes delta, a 21-lot QQQ call was authorized as
+$1,911 of exposure and landed as **$510,170** (2026-08-07).
+
+| position | measured as | why |
+|---|---|---|
+| Short options | delta notional | loss is unbounded; nothing about premium bounds it |
+| Long, \|delta\| ≥ 0.5 | delta notional | stock replacement — a 0.85-delta call tracks the underlying ~1:1 and its premium is large |
+| Long, \|delta\| < 0.5 | **premium** | capped-loss ticket — a 0DTE 0.33-delta call shows $510k of delta against $1,911 of premium and cannot lose more than the premium |
+
+`theta` follows the same principle: a long option's daily decay is bounded by its
+premium. Black-Scholes theta is an instantaneous rate that explodes into expiry — a
+21-lot 0DTE call holding $1,932 of premium reports **−$7,930/day**, a loss it cannot
+physically realise, and it made theta the binding limit for a position whose true
+worst case is the premium.
+
+### The 0DTE leverage arithmetic — read this before sizing the sleeve
+
+An at-the-money 0DTE contract carries **~255x delta per premium dollar** ($92 of
+premium = $23,446 of delta). So the net-delta cap, not premium and not cash, is what
+bounds this sleeve:
+
+| net-delta cap | delta budget (on $100k) | live 0DTE premium it supports |
+|---|---|---|
+| 3x | $300,000 | $1,177 |
+| **8x** (current explosive) | $800,000 | **$3,139** |
+| 20x | $2,000,000 | $7,848 |
+| 40x | $4,000,000 | $15,696 |
+| 80x | $8,000,000 | $31,392 |
+
+**Holding $30k of live 0DTE premium needs roughly a 76x net-delta cap** — i.e. no
+meaningful delta limit at all. That is a property of the instrument, not a limit that
+can be tuned around, and it is why the 0DTE sleeve is sized at 3.2% premium per trade
+(so all four concurrent positions fit the 8x budget) rather than the 8% a premium-only
+view would suggest. Above ~40x the delta limit has stopped bounding anything and the
+real protection is `max_long_option_premium_pct` (65%) — which, for a book that is
+purely long options with capped loss, is arguably the correct bound anyway.
+
+**Which limit actually bounds leverage.** The gross-leverage row is computed on *premium*,
+so on an options book it effectively never binds — $19.5k of premium against a $201k cap
+while the book carried **1.35x equity** of real delta exposure (measured live 2026-08-07).
+Delta leverage is bounded instead by the three checks that use delta-adjusted notional:
+per-underlying (70%), per-sector (80%), and net dollar delta (300%). Those are the numbers
+to watch; gross-leverage-on-premium is a premium-at-risk guard wearing a leverage label.
 
 The premium cap is the one that bounds the worst case: loss on a long option is capped at
 its premium **per position**, but premium that all expires worthless is a 100% loss of every
 dollar deployed. 50% is sized for **deep-ITM** contracts (0.80 delta), which retain intrinsic
-value when wrong — it would be reckless for OTM.
+value when wrong — it would be reckless for OTM. The `zero_dte` sleeve buys *near-the-money*
+contracts that decay to zero the same day, which is why its own per-trade and per-day caps
+(8% of sleeve capital per trade, 12 entries/day, 4 concurrent) bind long before this one does.
 
 ### What the evidence actually says (2023-2025 walk-forward, real Alpaca bars)
 
@@ -121,7 +174,60 @@ Judge sleeves on **out-of-sample** columns only. Six validation runs to date:
 | `put_income` | 1-3wk cash-secured puts | +0.58 to +1.60, positive every run | validated |
 | `momentum_equity` | shares | +0.65 to +1.47 | validated |
 | `momentum` (options) | 1-3wk deep-ITM calls | +0.36 (was negative in longer-dated variants) | promising, not proven |
-| `convexity` | short-dated long options | negative in **all six** runs | disproven; kept small as a crash hedge |
+| `convexity` | short-dated long options | negative in **all six** runs | **disproven — removed from the explosive lineup** |
+| `zero_dte` | same-session options | **never measured** | **unvalidated — see below** |
+
+#### `zero_dte` cannot be validated by this harness
+
+The backtest engine is daily with t+1 execution. A 0DTE option is born and dies inside one
+session, so there is no way for it to appear in a walk-forward run — its OOS Sharpe is not
+"bad", it is *undefined*. Measuring it needs historical **intraday option quotes**
+(ThetaData/ORATS class), which the free tier does not carry.
+
+What is known: `convexity` — long short-dated options, the nearest relative — lost money in
+all six out-of-sample runs at a 5-17% hit rate. 0DTE is that trade with 100% of the premium
+as time value and no time to recover. It is in the lineup because it was explicitly asked
+for, and it is capped so a bad run is survivable, not because evidence supports it.
+
+What *has* been measured is **signal frequency** (not profit): replaying 15 trading days of
+real 1-min SPY/QQQ/IWM bars through the live signal code fires a mean of 26 signals/day,
+range 7-44, with zero signal-free days. The sleeve's own 12-entry/day cap binds, not the
+signal supply.
+
+The other measured number is the **friction hurdle**. Round-trip option fees are ~1.4% of
+premium, and the sleeve crosses the full spread each way. Against its +60% / -35% bracket
+that sets breakeven win rate at:
+
+| contract spread | total friction | breakeven win rate |
+|---|---|---|
+| 1.6% (IWM median) | 3.0% | 40.0% |
+| 2.8% (SPY median) | 4.2% | 41.3% |
+| 5.2% (QQQ median) | 6.6% | 43.8% |
+| 10% (sleeve's reject threshold) | 11.4% | 48.9% |
+
+Zero-friction breakeven would be 36.8%. `convexity` — the only comparable sleeve that has
+actually been measured on this platform — ran a **5-17% hit rate**. This sleeve has to be
+a fundamentally better signal than that one, not a marginally better one.
+
+#### Measured bracket execution (first live session, 2026-08-07)
+
+Brackets are evaluated on the MID but executed at the BID, on a 60-second loop, so both
+sides slip. Three clean stop-losses (excluding one that a since-fixed bug delayed):
+
+| contract | trigger | filled | vs -35% |
+|---|---|---|---|
+| IWM 300P | 0.163 | 0.15 (-40.0%) | -5.0% |
+| SPY 770P | 0.319 | 0.29 (-40.8%) | -5.8% |
+| QQQ 719P | 0.637 | 0.66 (-32.7%) | **+2.3%** |
+
+Mean **-2.8%**, range -5.8% to +2.3% — so realized brackets are roughly +57% / -38% and
+breakeven lands near **40%**, consistent with the estimate above. Note the third fill was
+*better* than its trigger: with n=3 the variance dwarfs the mean, and an early read off the
+first two samples alone would have wrongly suggested a systematic -5.4% drag. Do not size
+this sleeve off a handful of fills.
+
+Session result: **0 wins / 4 losses, -$1,414 realized** on 8 fills. That is a count, not a
+result — and roughly $416 of it was a risk-gate bug rejecting a stop-loss, not the strategy.
 
 Caveats that matter: option chains in historical backtests are Black-Scholes-priced off
 realized vol (real historical chains aren't on the free data tier), so short-vol premium is

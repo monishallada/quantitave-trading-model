@@ -155,10 +155,10 @@ class TestExplosiveProfile:
         monkeypatch.setenv("QF_DATA_DIR", str(tmp_path))
         s = load_settings(env_file=None)
         assert s.risk_profile == "explosive"
-        assert s.risk.daily_loss_halt_pct == 0.15
+        assert s.risk.daily_loss_halt_pct == 0.25
         assert s.risk.allow_short_equity is True
         assert s.risk.allow_naked_short_options is False  # stays banned
-        assert s.risk.max_net_delta_pct == 3.0
+        assert s.risk.max_net_delta_pct == 40.0
 
     def test_default_stays_conservative(self, tmp_path, monkeypatch):
         from quantfund.core.config import load_settings

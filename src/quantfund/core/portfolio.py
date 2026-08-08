@@ -22,6 +22,98 @@ from quantfund.core.orders import Fill
 from quantfund.core.snapshot import MarketSnapshot
 
 
+# Below this |delta| a LONG option is a capped-loss ticket: its premium, not
+# its delta notional, is what can actually be lost. At or above it the contract
+# behaves like leveraged stock (a 0.85-delta call tracks the underlying nearly
+# 1:1 and its premium is large), so delta notional is the honest measure.
+#
+# 0.70, not 0.50. The threshold has to separate STOCK REPLACEMENT from LOTTERY
+# TICKET, and an at-the-money option is not stock replacement — it has roughly
+# even odds of expiring worthless. At 0.50 the cliff sat exactly where 0DTE
+# trades: a 0.49-delta contract measured $4.5k of premium and a 0.51-delta
+# contract measured $1.79M of delta notional, so identical trades were
+# accepted or rejected on a rounding error in delta.
+# This does NOT remove sensitivity control: net dollar delta (risk check 8)
+# still counts RAW delta for every option and is capped by
+# max_net_delta_pct. The per-underlying and per-sector caps are
+# loss-concentration limits, which is what they should be for a capped-loss
+# long. The momentum sleeve's 0.80-delta stock-replacement calls stay on
+# delta notional, which is the case this threshold exists to catch.
+ITM_DELTA_THRESHOLD = 0.70
+
+
+def option_group_key(inst) -> tuple:
+    """(underlying, right, expiration) — the unit within which longs and
+    shorts offset each other, matching the naked-short coverage check."""
+    return (inst.underlying_symbol, inst.right, inst.expiration)
+
+
+def option_exposure(qty: float, multiplier: float, delta: Optional[float],
+                    underlying_price: Optional[float], premium: Optional[float],
+                    fallback: float = 0.0, group_has_short: bool = False) -> float:
+    """Directional exposure of one option position, by moneyness.
+
+    SHORT options always use delta notional — their loss is unbounded, so
+    nothing about premium bounds them.
+
+    LONG options split on |delta|:
+      * |delta| <  ITM_DELTA_THRESHOLD -> signed PREMIUM notional. A 0DTE
+        0.33-delta call shows $510k of delta notional against $1,911 of
+        premium; it cannot lose more than the premium, so measuring it by
+        delta both overstates the risk and crowds every other sleeve out of
+        the per-underlying and per-sector budgets.
+      * |delta| >= ITM_DELTA_THRESHOLD -> delta notional. A deep-ITM call is
+        stock replacement; pricing it at premium would hide real leverage.
+
+    Used by BOTH Portfolio.exposure_by_underlying and the pre-trade risk gate.
+    They MUST agree: when the gate sized 0DTE by premium while the book marked
+    it by Black-Scholes delta, a 21-lot was authorized as $1,911 of exposure
+    and landed as $510,170 (2026-08-07).
+    """
+    if delta is None or not underlying_price or underlying_price <= 0:
+        return fallback
+    delta_notional = delta * qty * multiplier * underlying_price
+    if qty < 0:
+        return delta_notional
+    # SPREADS: if this group also holds shorts, measure the long on the SAME
+    # basis so the legs offset. Mixing bases is not additive — a defined-risk
+    # vertical showed the long leg at premium and its covering short at full
+    # delta notional, so the spread read like a large naked short and was
+    # rejected. Delta notional is additive and nets correctly across legs.
+    if group_has_short:
+        return delta_notional
+    if abs(delta) >= ITM_DELTA_THRESHOLD:
+        return delta_notional
+    if premium is None or premium <= 0:
+        return fallback
+    # keep the DIRECTION (long put is short the underlying), size by premium
+    sign = 1.0 if delta >= 0 else -1.0
+    return sign * premium * qty * multiplier
+
+
+def option_theta_per_day(qty: float, multiplier: float,
+                        theta: Optional[float],
+                        premium: Optional[float]) -> float:
+    """Daily decay of one option position, bounded by what can actually decay.
+
+    Black-Scholes theta is an INSTANTANEOUS rate. As time-to-expiry goes to
+    zero it explodes: a 21-lot QQQ 0DTE call carrying $1,932 of total premium
+    reports -$7,930/day. That rate is never realised — a long option cannot
+    decay past zero, so its worst case over a day is the premium itself.
+
+    Same principle as ``option_exposure``: for a capped-loss LONG, the premium
+    is the bound. Short options are NOT capped (decay works for you, but the
+    position's risk is unbounded elsewhere), so they pass through unmodified.
+    """
+    if theta is None:
+        return 0.0
+    raw = theta * qty * multiplier
+    if qty <= 0 or premium is None or premium <= 0:
+        return raw
+    max_decay = premium * qty * multiplier      # cannot lose more than paid
+    return -min(abs(raw), abs(max_decay)) if raw < 0 else raw
+
+
 @dataclass
 class Position:
     instrument: Instrument
@@ -200,7 +292,23 @@ class Portfolio:
         return sum(p.market_value for p in self.positions.values() if p.is_open)
 
     def gross_exposure(self) -> float:
+        """Sum of |market value|. For options this is PREMIUM, not economic
+        exposure — a $1.8k deep-ITM call controls ~$65k of stock. Use
+        ``gross_delta_exposure`` to judge how deployed the book actually is;
+        this number is what is at risk of going to zero, which is a different
+        (and for long options, the more relevant) question."""
         return sum(p.notional for p in self.positions.values() if p.is_open)
+
+    def gross_delta_exposure(self) -> float:
+        """Economic exposure: delta-adjusted notional, summed absolutely.
+
+        This is the number that answers "how much of the portfolio is
+        working?" — and it is the one the risk gate enforces per-underlying
+        and per-sector. Reporting only ``gross_exposure`` made a book with
+        ~1x delta exposure look 19% deployed, because option premium is a
+        small fraction of the stock an option controls.
+        """
+        return sum(abs(v) for v in self.exposure_by_underlying().values())
 
     def net_exposure(self) -> float:
         return sum(p.market_value for p in self.positions.values() if p.is_open)
@@ -216,16 +324,24 @@ class Portfolio:
 
     def exposure_by_underlying(self) -> dict[str, float]:
         out: dict[str, float] = {}
+        short_groups = {
+            option_group_key(p.instrument)
+            for p in self.positions.values()
+            if p.is_open and isinstance(p.instrument, Option) and p.qty < 0
+        }
         for p in self.positions.values():
             if not p.is_open:
                 continue
             u = p.instrument.underlying
             if isinstance(p.instrument, Option):
-                # directional exposure of an option = |delta| notional when known
-                if p.greeks is not None and p.underlying_mark:
-                    expo = p.greeks.delta * p.qty * p.multiplier * p.underlying_mark
-                else:
-                    expo = p.market_value
+                expo = option_exposure(
+                    qty=p.qty, multiplier=p.multiplier,
+                    delta=(p.greeks.delta if p.greeks is not None else None),
+                    underlying_price=p.underlying_mark,
+                    premium=(p.mark if p.mark is not None else p.avg_cost),
+                    fallback=p.market_value,
+                    group_has_short=option_group_key(p.instrument) in short_groups,
+                )
             else:
                 expo = p.market_value
             out[u] = out.get(u, 0.0) + expo
@@ -256,7 +372,9 @@ class Portfolio:
                 under = p.underlying_mark or 0.0
                 dollar_delta += p.greeks.delta * mult * under
                 gamma_shares += p.greeks.gamma * mult
-                theta += p.greeks.theta * mult
+                theta += option_theta_per_day(
+                    qty=p.qty, multiplier=p.multiplier, theta=p.greeks.theta,
+                    premium=(p.mark if p.mark is not None else p.avg_cost))
                 vega += p.greeks.vega * mult
         return PortfolioGreeks(
             dollar_delta=dollar_delta, gamma_shares=gamma_shares,

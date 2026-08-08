@@ -8,6 +8,7 @@ from __future__ import annotations
 
 import os
 from dataclasses import dataclass, field
+from datetime import time as dtime
 from pathlib import Path
 
 from dotenv import load_dotenv
@@ -25,7 +26,7 @@ DEFAULT_OPTIONS_UNIVERSE = ["SPY", "QQQ", "AAPL", "MSFT", "NVDA", "AMZN",
                             "TSLA", "GOOGL", "META", "AMD", "NFLX"]
 
 SECTOR_MAP: dict[str, str] = {
-    "SPY": "INDEX", "QQQ": "INDEX",
+    "SPY": "INDEX", "QQQ": "INDEX", "IWM": "INDEX",
     "AAPL": "TECH", "MSFT": "TECH", "NVDA": "TECH", "AVGO": "TECH", "AMD": "TECH",
     "GOOGL": "COMM", "META": "COMM", "NFLX": "COMM",
     "AMZN": "CONS_DISC", "TSLA": "CONS_DISC", "HD": "CONS_DISC",
@@ -94,35 +95,37 @@ class RiskLimits:
         expected value. Never use these numbers with real money.
         """
         return cls(
-            # 0.70 / 0.80: the momentum universe is tech-heavy and ONE
-            # deep-ITM index call is ~50% of a $100k account's equity, so
-            # tighter caps rejected the fills outright. Concentration risk
-            # is accepted here deliberately; the drawdown halt is the
-            # backstop.
-            # (was 0.55: ONE deep-ITM index-ETF call carries ~50% of a $100k
-            # account's equity in delta ($0.65 x 100 x $771 SPY). At 0.35 the
-            # sleeve could not hold a single SPY/QQQ contract and sat in cash.
-            # 0.55 admits one contract per index name, not two.
-            max_position_pct=0.70,
-            max_sector_pct=0.80,
-            max_strategy_pct=0.60,
-            max_gross_leverage=2.0,
-            max_net_delta_pct=3.0,          # options delta may exceed equity
-            max_theta_pct_per_day=0.02,     # short-dated longs burn theta fast
-            max_vega_pct=0.05,
-            max_order_notional=40_000.0,
-            max_position_notional=60_000.0,
-            daily_loss_halt_pct=0.15,       # still flattens at -15%/day
-            max_drawdown_halt_pct=0.40,     # hard floor: -40% from peak
-            max_trades_per_hour=60,
+            # MAXIMUM-AGGRESSION paper profile. Sized so the book can run
+            # near-fully deployed with a fast intraday engine. Every number
+            # here is far outside anything defensible with real money.
+            # Concentration is accepted deliberately; the daily-loss and
+            # drawdown halts are the only real backstops left.
+            max_position_pct=1.00,          # one name may carry 100% of equity
+            max_sector_pct=1.50,
+            max_strategy_pct=0.70,
+            max_gross_leverage=4.0,
+            # 40x: an ATM 0DTE contract carries ~255x delta per premium
+            # dollar, so the delta cap is what bounds the intraday sleeve.
+            # 8x supported ~$3.1k of live 0DTE premium; 40x supports ~$15.7k.
+            max_net_delta_pct=40.0,
+            max_theta_pct_per_day=0.12,     # short-dated longs burn theta fast
+            max_vega_pct=0.15,
+            max_order_notional=150_000.0,
+            max_position_notional=200_000.0,
+            # Backstops kept ON PURPOSE. With this much size a bad session can
+            # take a quarter of the account; without these it could take all
+            # of it, which ends the experiment rather than informing it.
+            daily_loss_halt_pct=0.25,       # flattens at -25%/day
+            max_drawdown_halt_pct=0.50,     # hard floor: -50% from peak
+            max_trades_per_hour=250,        # rapid book; still a runaway guard
             allow_naked_short_options=False,  # undefined risk stays banned
             allow_short_equity=True,
-            min_cash_buffer_pct=0.02,
-            target_portfolio_vol=0.60,      # vol targeting mostly stands aside
-            # 50%: half the book in long option premium. Chosen for DEEP-ITM calls,
-            # which retain intrinsic value when wrong (a 0.75-delta call loses ~30%
-            # on a 5% adverse move, not 100%). This cap would be reckless for OTM.
-            max_long_option_premium_pct=0.65,
+            min_cash_buffer_pct=0.01,
+            target_portfolio_vol=1.50,      # vol targeting effectively stands aside
+            # 85% of equity may sit in long option premium. This is the number
+            # that bounds the worst case: premium that all expires worthless is
+            # a 100% loss of every dollar deployed.
+            max_long_option_premium_pct=0.85,
         )
 
 
@@ -154,7 +157,13 @@ class Settings:
 
     dashboard_port: int = 8000
     poll_interval_sec: float = 60.0         # live loop cadence
-    rebalance_interval_sec: float = 900.0   # how often strategies re-evaluate
+    rebalance_interval_sec: float = 300.0   # how often strategies re-evaluate
+    # Backstop: flatten ANY option expiring today after this UTC time,
+    # regardless of which sleeve owns it or whether that sleeve ran. Set
+    # AFTER a 0DTE sleeve's own force-flat so the sleeve exits on its own
+    # terms first; this only catches what it missed. 19:45 UTC = 15:45 ET,
+    # 15 minutes before the close — enough room to actually get filled.
+    expiry_flatten_after_utc: dtime = dtime(19, 45)
     data_dir: Path = field(default_factory=lambda: Path("data"))
     risk_free_rate: float = 0.04
 

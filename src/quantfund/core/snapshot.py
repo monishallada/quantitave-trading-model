@@ -169,6 +169,9 @@ class MarketSnapshot:
 
     as_of: datetime
     bars: dict[str, tuple[Bar, ...]] = field(default_factory=dict)
+    # intraday (e.g. 1-min) bars for same-session strategies such as 0DTE.
+    # Same pinning contract as daily bars: stamped at interval CLOSE.
+    intraday_bars: dict[str, tuple[Bar, ...]] = field(default_factory=dict)
     quotes: dict[str, Quote] = field(default_factory=dict)
     option_chains: dict[str, OptionChain] = field(default_factory=dict)
     news: tuple[NewsItem, ...] = ()
@@ -182,6 +185,13 @@ class MarketSnapshot:
                     raise LookaheadError(
                         f"bar for {symbol} at {b.ts.isoformat()} is after snapshot "
                         f"as_of {self.as_of.isoformat()}"
+                    )
+        for symbol, bars in self.intraday_bars.items():
+            for b in bars:
+                if b.ts > self.as_of:
+                    raise LookaheadError(
+                        f"intraday bar for {symbol} at {b.ts.isoformat()} is after "
+                        f"snapshot as_of {self.as_of.isoformat()}"
                     )
         for symbol, q in self.quotes.items():
             if q.ts > self.as_of:
@@ -223,6 +233,22 @@ class MarketSnapshot:
         if lookback is not None:
             out = out[-lookback:]
         return out
+
+    def get_intraday_bars(self, symbol: str, lookback: Optional[int] = None) -> list[Bar]:
+        """Intraday bars with close time <= as_of, oldest first."""
+        out = [b for b in self.intraday_bars.get(symbol, ()) if b.ts <= self.as_of]
+        out.sort(key=lambda b: b.ts)
+        if lookback is not None:
+            out = out[-lookback:]
+        return out
+
+    def session_vwap(self, symbol: str) -> Optional[float]:
+        """Volume-weighted average price across the intraday bars in view."""
+        bars = self.get_intraday_bars(symbol)
+        vol = sum(b.volume for b in bars)
+        if not bars or vol <= 0:
+            return None
+        return sum(((b.high + b.low + b.close) / 3.0) * b.volume for b in bars) / vol
 
     def last_close(self, symbol: str) -> Optional[float]:
         bars = self.get_bars(symbol)

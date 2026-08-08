@@ -200,7 +200,9 @@ function renderTiles(s) {
     tile("Buying power", fmt$(p.buying_power)) +
     tile("Day P&L", fmt$(p.day_pnl), p.day_pnl) +
     tile("Total P&L", fmt$(p.total_pnl), p.total_pnl) +
-    tile("Gross exposure", fmt$(p.gross_exposure)) +
+    tile("Premium at risk", fmt$(p.gross_exposure)) +
+    tile("Economic exposure", fmt$(p.gross_delta_exposure) +
+         (p.equity ? " (" + (p.gross_delta_exposure / p.equity).toFixed(2) + "x)" : "")) +
     tile("Drawdown", p.drawdown == null ? "—" : (p.drawdown * 100).toFixed(1) + "%") +
     tile("Costs paid", fmt$2(p.total_costs));
 }

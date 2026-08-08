@@ -75,6 +75,10 @@ class Strategy(ABC):
     name: str = "Base"
     warmup_bars: int = 50            # minimum history before emitting signals
     uses_options: bool = False
+    # True => the runner evaluates this sleeve EVERY loop, not only on the
+    # slow rebalance cadence. Intraday sleeves (0DTE) are useless at 15-min
+    # granularity: their positions live and die within the session.
+    fast_cadence: bool = False
 
     @abstractmethod
     def generate_signals(self, snapshot: MarketSnapshot, ctx: SleeveContext) -> list[Signal]:

@@ -76,6 +76,11 @@ class LiveRunner:
         # reconciliation breaker instead of comparing the broker to itself.
         self._local_qty: dict[str, float] = {}
         self._local_seeded = False
+        # contracts the expiry guard has already sent a flatten for today —
+        # re-sending while the first order works would double-sell into a short
+        self._expiry_guard_sent: set[str] = set()
+        self._expiry_guard_day = None
+        self._returns_day = None
         self._last_rebalance: Optional[datetime] = None
         self._current_day = None
         self._flattened_by_breaker = False
@@ -103,6 +108,18 @@ class LiveRunner:
                 mark_ts=snapshot.as_of,
             )
         fresh.mark_from_snapshot(snapshot, risk_free=self.settings.risk_free_rate)
+        # Cumulative costs come from the durable trade log EVERY sync, not from
+        # this process's ingested fills. _ingest_fills applies fills to the
+        # SLEEVES; the master portfolio is rebuilt from broker positions each
+        # loop, so its total_costs was never incremented at all — the
+        # dashboard's "costs paid" tile has always read $0.00 while real fees
+        # were being paid ($62.01 on 2026-08-07).
+        try:
+            cf, tot = self.state.total_costs_recorded()
+            fresh.total_commissions_fees = cf
+            fresh.total_costs = tot
+        except Exception as e:  # noqa: BLE001
+            self.breakers.record_error("seed_costs", repr(e))
         if not self._local_seeded:
             # first sync of this process: trust the broker as the baseline for
             # BOTH the reconciliation book and the P&L/drawdown anchors —
@@ -121,8 +138,75 @@ class LiveRunner:
                 self.breakers.record_error("broker.get_fills(seed)", str(e))
             fresh.starting_equity = account.equity
             fresh.peak_equity = account.equity
+            self._reattribute_sleeves(broker_positions, snapshot)
         self.portfolio = fresh
         self._broker_positions = broker_positions
+        # Re-mark EVERY sleeve every loop. Sleeve positions are only touched by
+        # apply_fill, which stamps mark = fill price — so without this a
+        # sleeve's mark is frozen at its entry forever and every mark-based
+        # exit is dead code: 0DTE take-profit/stop-loss, put_income's
+        # profit-take and loss-stop. The QQQ 0DTE call reached +60.3% on the
+        # master book on 2026-08-07 while its sleeve still saw the 0.92 entry,
+        # so the take-profit never fired. Sleeve equity feeds the allocator's
+        # Sharpe scoring too, so stale marks quietly corrupt allocation.
+        for sleeve in self.sleeves.values():
+            sleeve.mark_from_snapshot(snapshot,
+                                      risk_free=self.settings.risk_free_rate)
+
+    def _reattribute_sleeves(self, broker_positions, snapshot) -> None:
+        """Rebuild sleeve ownership of pre-existing positions after a restart.
+
+        Ownership normally lives in ``_order_meta``, which is in-memory and
+        dies with the process. The master book is rebuilt from the broker, but
+        the sleeves came back EMPTY, so every open position was orphaned:
+
+          * nobody ran put_income's profit-take / loss-stop / time exits,
+          * nobody rolled momentum's ITM calls,
+          * a 0DTE contract open across a restart lost its TP/SL brackets
+            (the expiry guard still caught it, but only at the close),
+          * and worst, each sleeve saw ``current = 0`` for names it already
+            held, so it re-requested the full target and doubled up until the
+            risk gate rejected it — the exposure-rejection spam in the event
+            log was this bug, not a limit that was too tight.
+
+        The trades table already persists strategy_id per instrument, so
+        ownership is recoverable. Positions are seeded from BROKER truth (not
+        replayed history) so a sleeve's book can never contradict the account.
+        """
+        try:
+            owners: dict[str, str] = {}
+            for t in self.state.get_trades(limit=5000):   # newest first
+                owners.setdefault(t["instrument_key"], t["strategy_id"])
+        except Exception as e:  # noqa: BLE001
+            self.breakers.record_error("reattribute", repr(e))
+            return
+        from quantfund.core.portfolio import Position
+        claimed = 0
+        for bp in broker_positions:
+            sid = owners.get(bp.instrument.key)
+            sleeve = self.sleeves.get(sid) if sid else None
+            if sleeve is None:
+                self.state.log_event(
+                    "warning", "reattribute",
+                    f"{bp.instrument.key} ({bp.qty:+g}) has no known sleeve — "
+                    "no strategy will manage its exit")
+                continue
+            sleeve.positions[bp.instrument.key] = Position(
+                instrument=bp.instrument, qty=bp.qty,
+                avg_cost=bp.avg_entry_price,
+                mark=(bp.market_value / (bp.qty * bp.instrument.multiplier))
+                if bp.qty else bp.avg_entry_price,
+                mark_ts=snapshot.as_of,
+            )
+            claimed += 1
+        for sleeve in self.sleeves.values():
+            sleeve.mark_from_snapshot(snapshot,
+                                      risk_free=self.settings.risk_free_rate)
+        if claimed:
+            self.state.log_event(
+                "info", "reattribute",
+                f"restored {claimed}/{len(broker_positions)} positions to "
+                "their owning sleeves")
 
     # ── signal → order ───────────────────────────────────────────────────
 
@@ -155,16 +239,80 @@ class LiveRunner:
         pos = sleeve.positions.get(inst.key)
         current = (pos.qty * price * mult) if pos else 0.0
         delta = target_dollars - current
-        # No-trade band: ignore drift under 25% of target. Without this the
-        # sleeve re-trades on every 15-min rebalance as ranks/vols wobble
-        # (2026-08-03: 85 equity trades in one session, all friction).
-        if current != 0.0 and abs(delta) < 0.25 * abs(target_dollars):
+        # No-trade band: ignore drift under 12% of target. Widened to 25% once
+        # to stop churn (2026-08-03: 85 equity trades in one session); halved
+        # again deliberately for a faster, more actively-rebalanced book. This
+        # buys turnover with friction — max_trades_per_hour is the backstop.
+        if current != 0.0 and abs(delta) < 0.12 * abs(target_dollars):
             return None
         qty = int(abs(delta) / (price * mult))
         if qty < 1:
             return None
         side = OrderSide.BUY if delta > 0 else OrderSide.SELL
         return single_leg(inst, side, float(qty), strategy_id=sig.strategy_id)
+
+    # ── expiry guard ─────────────────────────────────────────────────────
+
+    def _close_expiring_options(self, snapshot: MarketSnapshot) -> int:
+        """Flatten every long option expiring TODAY once past the cutoff.
+
+        A sleeve's own forced-flat only fires if that sleeve runs: it can be
+        starved of capital, throw, be throttled, or have its signals rejected.
+        None of that is acceptable for a same-day option, because the failure
+        is not symmetric:
+
+          * expires OTM -> worthless. Loss capped at premium. Survivable.
+          * expires ITM -> Alpaca AUTO-EXERCISES. Each contract assigns 100
+            shares. Twelve SPY contracts is ~$900k of stock delivered into a
+            $100k account overnight — a leverage event far larger than any
+            risk limit this platform enforces.
+
+        So this runs unconditionally, every loop, before the breakers and
+        outside the rebalance throttle, for options owned by ANY sleeve.
+
+        SUBMIT ONCE PER CONTRACT PER DAY. The broker position does not clear
+        the instant the order is sent, so a naive "flatten anything still
+        showing" would re-send every 60s while the first sell was still
+        working — selling 21 contracts twice turns a long call into a NAKED
+        SHORT, the one exposure this platform bans outright. Being late to
+        re-try is recoverable; accidentally going short 0DTE is not.
+        """
+        now = utcnow()
+        if now.time() < self.settings.expiry_flatten_after_utc:
+            return 0
+        today = now.date()
+        if self._expiry_guard_day != today:
+            self._expiry_guard_day = today
+            self._expiry_guard_sent.clear()
+        closed = 0
+        for pos in list(self.portfolio.positions.values()):
+            inst = pos.instrument
+            if not (isinstance(inst, Option) and pos.is_open):
+                continue
+            if inst.key in self._expiry_guard_sent:
+                continue
+            if inst.expiration != today:
+                continue
+            side = OrderSide.SELL if pos.qty > 0 else OrderSide.BUY
+            order = single_leg(inst, side, abs(pos.qty),
+                               strategy_id="expiry_guard")
+            try:
+                self.broker.submit_order(order)
+            except BrokerError as e:
+                self.breakers.record_error("expiry_guard", str(e))
+                self.state.log_event(
+                    "critical", "expiry_guard",
+                    f"COULD NOT flatten {inst.symbol} expiring today: {e}")
+                continue
+            # mark sent ONLY after the broker accepted it — a submit that
+            # raised must be retried next loop, not silently abandoned
+            self._expiry_guard_sent.add(inst.key)
+            closed += 1
+            self.state.log_event(
+                "warning", "expiry_guard",
+                f"flattened {inst.symbol} ({pos.qty:+g}) expiring {today} — "
+                f"never hold a 0DTE contract into the close")
+        return closed
 
     # ── fills → accounting ───────────────────────────────────────────────
 
@@ -224,6 +372,7 @@ class LiveRunner:
             "realized_pnl": self.portfolio.realized_pnl(),
             "unrealized_pnl": self.portfolio.unrealized_pnl(),
             "gross_exposure": self.portfolio.gross_exposure(),
+            "gross_delta_exposure": self.portfolio.gross_delta_exposure(),
             "net_exposure": self.portfolio.net_exposure(),
             "drawdown": self.portfolio.drawdown(),
             "total_costs": self.portfolio.total_costs,
@@ -299,9 +448,20 @@ class LiveRunner:
             # as_of=None => LIVE mode: the provider stamps the snapshot after
             # collection so freshly-arrived quotes/chains aren't discarded as
             # "future data" (that emptied the option chains on 2026-08-04)
+            intraday_syms = sorted({
+                u for st in self.strategies
+                if getattr(st, "fast_cadence", False)
+                for u in getattr(st, "underlyings", [])
+            })
+            # A fast sleeve's underlyings must have chains fetched even when
+            # they are not in the configured options universe — otherwise the
+            # sleeve silently sees no contracts and never trades.
+            option_unders = sorted(set(self.settings.options_universe)
+                                   | set(intraday_syms))
             snapshot = self.provider.build_snapshot(
                 self.settings.universe, as_of=None,
-                options_underlyings=self.settings.options_universe,
+                options_underlyings=option_unders,
+                intraday_symbols=intraday_syms or None,
             )
             result["snapshot_ts"] = snapshot.as_of.isoformat()
             # keep a sim broker priced off the current snapshot (no-op for Alpaca)
@@ -313,6 +473,9 @@ class LiveRunner:
             if self.portfolio.day_anchor_equity is None:
                 self.portfolio.start_new_day()
             result["fills"] = self._ingest_fills()
+
+            # 2b. EXPIRY GUARD — unconditional, before everything else.
+            result["expiry_closed"] = self._close_expiring_options(snapshot)
 
             # 3. breakers (reconciliation compares the fill-derived local book
             # against broker truth — never the broker-rebuilt mirror)
@@ -339,8 +502,11 @@ class LiveRunner:
             due = (self._last_rebalance is None or
                    (now - self._last_rebalance).total_seconds()
                    >= self.settings.rebalance_interval_sec)
-            if due:
-                self._last_rebalance = now
+            fast_only = not due and any(
+                getattr(st, "fast_cadence", False) for st in self.strategies)
+            if due or fast_only:
+                if due:
+                    self._last_rebalance = now
                 total_eq = self.portfolio.equity()
                 sleeves_perf = [
                     SleevePerf(sid, self.sleeve_returns[sid])
@@ -349,7 +515,15 @@ class LiveRunner:
                 alloc = self.allocator.allocate(total_eq, sleeves_perf)
                 self.sleeve_capital = alloc
                 killed_mid_pass = False
-                for strat in self.strategies:
+                # On a fast-only pass, evaluate ONLY the fast sleeves.
+                # Iterating every sleeve here would run the slow sleeves on the
+                # poll interval instead of the rebalance interval, silently
+                # discarding the throttle that keeps turnover (and friction)
+                # down — 2026-08-03 produced 85 equity trades in one session.
+                pass_strategies = ([st for st in self.strategies
+                                    if getattr(st, "fast_cadence", False)]
+                                   if fast_only and not due else self.strategies)
+                for strat in pass_strategies:
                     # the kill switch can engage from the dashboard thread while
                     # a strategy pass is running (LLM calls take minutes) —
                     # never submit orders decided before the kill
@@ -422,14 +596,29 @@ class LiveRunner:
                     return result
                 result["fills"] += self._ingest_fills()
 
-            # 5. sleeve daily-return tracking + publish
-            for sid, sleeve in self.sleeves.items():
-                eq = sleeve.equity()
-                prev = self._prev_sleeve_eq.get(sid)
-                if prev and prev > 0 and abs(eq - prev) > 1e-9:
-                    self.sleeve_returns[sid].append(eq / prev - 1.0)
-                    self.sleeve_returns[sid] = self.sleeve_returns[sid][-120:]
-                self._prev_sleeve_eq[sid] = eq
+            # 5. sleeve DAILY-return tracking + publish
+            # One sample per TRADING DAY, at the day boundary. The allocator's
+            # field is named daily_returns and it annualizes with sqrt(252);
+            # appending a sample every loop fed it ~390 intraday returns a day,
+            # so Sharpe was computed on 60-second returns and annualized as if
+            # daily, and vol targeting (std * sqrt(252)) understated realized
+            # vol by ~sqrt(390), quietly disabling itself. This was latent
+            # before — sleeve equity only moved on fills — and only became
+            # every-loop once sleeve marks started tracking the market.
+            today_utc = utcnow().date()
+            if self._returns_day is None:
+                self._returns_day = today_utc
+                self._prev_sleeve_eq = {
+                    sid: s.equity() for sid, s in self.sleeves.items()}
+            elif today_utc != self._returns_day:
+                for sid, sleeve in self.sleeves.items():
+                    eq = sleeve.equity()
+                    prev = self._prev_sleeve_eq.get(sid)
+                    if prev and prev > 0:
+                        self.sleeve_returns[sid].append(eq / prev - 1.0)
+                        self.sleeve_returns[sid] = self.sleeve_returns[sid][-120:]
+                    self._prev_sleeve_eq[sid] = eq
+                self._returns_day = today_utc
             self._publish(snapshot)
             self.breakers.record_success()
             result["equity"] = self.portfolio.equity()

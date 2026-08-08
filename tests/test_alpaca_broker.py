@@ -54,7 +54,24 @@ class FakeTradingClient:
                                buying_power="60000", options_approved_level=2)
 
     def get_orders(self, req):
-        return []
+        # one filled option buy + one filled equity sell, in Alpaca's shape
+        # (no commission/fee fields — that absence is the point)
+        return [
+            SimpleNamespace(
+                id="ord-opt", status=SimpleNamespace(value="filled"),
+                symbol="AAPL240719C00200000", legs=None,
+                side=SimpleNamespace(value="buy"),
+                filled_qty="21", filled_avg_price="0.92",
+                filled_at=datetime(2024, 6, 3, 15, 8, tzinfo=UTC),
+                updated_at=datetime(2024, 6, 3, 15, 8, tzinfo=UTC)),
+            SimpleNamespace(
+                id="ord-eq", status=SimpleNamespace(value="filled"),
+                symbol="AAPL", legs=None,
+                side=SimpleNamespace(value="sell"),
+                filled_qty="100", filled_avg_price="190.50",
+                filled_at=datetime(2024, 6, 3, 15, 9, tzinfo=UTC),
+                updated_at=datetime(2024, 6, 3, 15, 9, tzinfo=UTC)),
+        ]
 
 
 @pytest.fixture
@@ -138,3 +155,24 @@ def test_api_error_wrapped(broker):
     broker._client.fail_submit = True
     with pytest.raises(BrokerError):
         broker.submit_order(single_leg(Equity("AAPL"), OrderSide.BUY, 1))
+
+
+def test_alpaca_fills_are_never_recorded_as_free(broker):
+    """Alpaca paper reports no commission/fee fields. Recording its fills at
+    zero cost makes a high-turnover sleeve look free: 0DTE runs ~480
+    contract-legs/day, which at $0.65/contract is ~$328/day of friction that
+    would otherwise never appear in the blotter or the equity curve's cost
+    column. The platform's "a zero-cost fill is a bug" rule applies here too.
+    """
+    from quantfund.core.costs import CostConfig
+
+    fills = broker.get_fills()
+    assert fills, "fixture must produce at least one fill for this to mean anything"
+    for f in fills:
+        total = f.commission + f.fees
+        assert total > 0, f"{f.instrument.key} recorded as a free fill"
+        if isinstance(f.instrument, Option):
+            assert f.commission == pytest.approx(
+                CostConfig().option_fee_per_contract * f.qty)
+        # the fill PRICE stays the broker's — we model fees, never execution
+        assert f.slippage_cost == 0.0

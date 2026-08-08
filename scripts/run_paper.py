@@ -17,6 +17,7 @@ import logging
 import signal
 import sys
 import threading
+from datetime import time as dtime
 
 from quantfund.allocation.allocator import CapitalAllocator
 from quantfund.core.config import load_settings
@@ -26,10 +27,10 @@ from quantfund.live.runner import LiveRunner
 from quantfund.risk.circuit_breakers import CircuitBreakerBoard
 from quantfund.risk.kill_switch import KillSwitch
 from quantfund.risk.limits import RiskManager
-from quantfund.strategies.convexity import ConvexMomentumStrategy
 from quantfund.strategies.mean_reversion import MeanReversionStrategy
 from quantfund.strategies.momentum import MomentumStrategy
 from quantfund.strategies.put_income import PutIncomeStrategy
+from quantfund.strategies.zero_dte import ZeroDTEStrategy
 
 logging.basicConfig(
     level=logging.INFO,
@@ -89,8 +90,21 @@ def build_platform():
         # -0.9% full period / +0.1% OOS, i.e. it earned nothing while
         # consuming equity budget the options sleeves need.
         strategies = [
-            PutIncomeStrategy(min_dte=7, max_dte=21, exit_dte=3),
-            ConvexMomentumStrategy(calls_enabled=False),  # crash convexity only
+            # 0DTE FIRST in the options-first queue: its positions live and die
+            # inside the session, so if it queues behind a sleeve that eats the
+            # cash/exposure budget it simply never trades.
+            # ⚠️ UNVALIDATED: the daily t+1 backtest engine cannot test a
+            # same-session instrument. Hard-capped on purpose — see zero_dte.py.
+            # MAX AGGRESSION: 13% of sleeve per trade, 6 concurrent, 40
+            # entries/day. Sized against the 40x net-delta budget (~$15.7k of
+            # live 0DTE premium on a $100k book at ~255x delta per premium
+            # dollar). This is the rapid engine: up to 80 option fills a day.
+            ZeroDTEStrategy(underlyings=["SPY", "QQQ", "IWM"],
+                            premium_per_trade_pct=0.13,
+                            max_concurrent=6, max_entries_per_day=40,
+                            take_profit=0.60, stop_loss=0.35,
+                            no_entry_after_utc=dtime(19, 15)),
+            PutIncomeStrategy(min_dte=7, max_dte=21, exit_dte=3, max_underlyings=6),
             # top_n=3 + 0.65 delta: concentrate the sleeve's capital so it can
             # always afford whole contracts (5 names x deep-ITM premium
             # exceeded the sleeve's budget and produced near-zero trades)
@@ -98,12 +112,20 @@ def build_platform():
             # stock with a capped downside, and they are the ONLY long-option
             # expression the 2023-25 evidence supports. Portfolio premium at
             # risk is bounded by RiskLimits.max_long_option_premium_pct.
-            MomentumStrategy(top_n=5, deploy_fraction=1.0, max_name_weight=0.45,
+            # Excludes the 0DTE underlyings. Option exposure is measured as
+            # DELTA-ADJUSTED NOTIONAL, so a single 0.80-delta SPY call is
+            # ~$65k of exposure against a $70k per-underlying cap — one
+            # contract saturates the name. Sharing SPY/QQQ/IWM with zero_dte
+            # meant every 0DTE order on them was rejected before it could be
+            # placed (measured live 2026-08-07: SPY $122k vs a $70.5k cap).
+            # The two options sleeves now trade disjoint universes.
+            MomentumStrategy(top_n=6, deploy_fraction=1.0, max_name_weight=0.60,
                              express_via="options", option_delta=0.80,
-                             option_leverage=5.0,
-                             option_max_premium_weight=0.70,
+                             option_leverage=7.0,
+                             option_max_premium_weight=0.95,
                              option_min_dte=7, option_max_dte=21,
-                             option_roll_dte=4),
+                             option_roll_dte=4,
+                             exclude=["SPY", "QQQ", "IWM"]),
             # Equity momentum LAST: it is the single best OOS-validated engine
             # in the platform (2023-25 walk-forward Sharpe 1.47) and lifts
             # portfolio OOS from ~-0.3 to ~+1.1. Deliberately constrained so it
@@ -113,8 +135,8 @@ def build_platform():
             # NON-optionable names only: keeps the equity core from taking
             # duplicate exposure in the same names as the options sleeves and
             # from eating their per-name / per-sector budget.
-            MomentumStrategy(top_n=3, deploy_fraction=0.55,
-                             max_name_weight=0.20, express_via="equity",
+            MomentumStrategy(top_n=4, deploy_fraction=0.95,
+                             max_name_weight=0.35, express_via="equity",
                              exclude=settings.options_universe,
                              strategy_id="momentum_equity",
                              name="Momentum (equity core)"),
@@ -146,15 +168,18 @@ def build_platform():
     # stops earning.
     allocator = (CapitalAllocator(
                      settings.risk, lookback=30, min_weight=0.08,
-                     base_weights={"momentum": 0.50,        # ITM calls
-                                   "put_income": 0.25,      # short puts
-                                   "convexity": 0.05,       # crash hedge
-                                   "momentum_equity": 0.20})
-                     # 80% of capital to the three OPTIONS sleeves;
-                     # convexity trimmed to 5% (6 straight negative
-                     # OOS validations) in favour of the two validated
-                     # engines. momentum_equity keeps 20% because it is
-                     # the strongest OOS sleeve in the platform.
+                     base_weights={"zero_dte": 0.35,        # rapid engine
+                                   "momentum": 0.30,        # ITM 1-3wk calls
+                                   "momentum_equity": 0.20,
+                                   "put_income": 0.15})     # short puts
+                     # 78% of capital to the three OPTIONS sleeves.
+                     # convexity is GONE: it lost money in all six
+                     # out-of-sample validations, and zero_dte now occupies
+                     # the same "long short-dated options" niche with a
+                     # tighter bracket. momentum_equity keeps 22% because it
+                     # is the strongest OOS sleeve in the platform and is
+                     # the only thing here with a positive validated Sharpe
+                     # backing the book when the options sleeves bleed.
                  if settings.risk_profile == "explosive"
                  else CapitalAllocator(settings.risk))
     runner = LiveRunner(
@@ -191,9 +216,47 @@ def main() -> int:
     signal.signal(signal.SIGINT, handle_sigint)
     signal.signal(signal.SIGTERM, handle_sigint)
 
-    t = threading.Thread(target=runner.run_forever, args=(stop,), daemon=True,
+    def supervised_loop():
+        """Never let the trading thread die silently. On 2026-08-06 a stalled
+        Alpaca socket killed this thread mid-session; uvicorn kept serving a
+        dashboard that said "live" for 37 hours while nothing traded."""
+        while not stop.is_set():
+            try:
+                runner.run_forever(stop)
+                return                      # clean exit (stop_event set)
+            except BaseException as e:      # noqa: BLE001
+                log.critical("TRADING LOOP CRASHED (%r) — restarting in 15s", e)
+                state.log_event("critical", "supervisor",
+                                f"trading loop crashed: {e!r} — restarting")
+                stop.wait(15)
+
+    t = threading.Thread(target=supervised_loop, daemon=True,
                          name="trading-loop")
     t.start()
+
+    def watchdog():
+        """Restart the loop thread if it stops completing iterations."""
+        nonlocal t
+        stale_limit = max(300.0, settings.poll_interval_sec * 5)
+        while not stop.is_set():
+            stop.wait(60)
+            if stop.is_set():
+                return
+            age = state.loop_age_seconds()
+            if not t.is_alive():
+                log.critical("WATCHDOG: trading thread is dead — restarting")
+                state.log_event("critical", "watchdog",
+                                "trading thread dead — restarted")
+                t = threading.Thread(target=supervised_loop, daemon=True,
+                                     name="trading-loop")
+                t.start()
+            elif age is not None and age > stale_limit:
+                log.critical("WATCHDOG: no completed loop for %.0fs "
+                             "(limit %.0fs) — loop is stalled", age, stale_limit)
+                state.log_event("critical", "watchdog",
+                                f"no completed trading loop for {age:.0f}s")
+
+    threading.Thread(target=watchdog, daemon=True, name="watchdog").start()
 
     from quantfund.dashboard.app import create_app
     import uvicorn

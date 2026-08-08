@@ -268,6 +268,22 @@ class PlatformState:
         return {"id": row[0], "ts": row[1], "strategy_id": row[2],
                 "payload": json.loads(row[3])}
 
+    def total_costs_recorded(self) -> tuple[float, float]:
+        """(commissions+fees, total friction) across every trade ever recorded.
+
+        The live Portfolio accumulates costs only from fills ingested in the
+        CURRENT process, and a restart marks prior fills as already-seen — so
+        the dashboard's "costs paid" tile reset to $0.00 on every restart while
+        real money had been spent ($62.01 on 2026-08-07 showed as zero). The
+        trades table is the durable record; seed from it.
+        """
+        with self._lock:
+            row = self._db.execute(
+                "SELECT COALESCE(SUM(commission + fees), 0.0),"
+                " COALESCE(SUM(commission + fees + slippage), 0.0) FROM trades"
+            ).fetchone()
+        return float(row[0]), float(row[1])
+
     def get_equity_curve(self, limit: int = 5000) -> list[dict]:
         with self._lock:
             rows = self._db.execute(
@@ -285,11 +301,25 @@ class PlatformState:
             ).fetchall()
         return [dict(zip(["ts", "level", "source", "message"], r)) for r in rows]
 
-    def snapshot_view(self) -> dict:
-        """One JSON-safe dict with everything the dashboard needs at a glance."""
+    def loop_age_seconds(self) -> Optional[float]:
+        with self._lock:
+            if self.last_loop_ts is None:
+                return None
+            return (utcnow() - self.last_loop_ts).total_seconds()
+
+    def snapshot_view(self, stall_after_sec: float = 600.0) -> dict:
+        """One JSON-safe dict with everything the dashboard needs at a glance.
+
+        Reports mode="STALLED" when the trading loop has not completed an
+        iteration recently — a dashboard that says "live" while the loop is
+        dead is worse than no dashboard (2026-08-06)."""
+        age = self.loop_age_seconds()
+        stalled = age is not None and age > stall_after_sec
         with self._lock:
             return {
-                "mode": self.mode,
+                "mode": "STALLED" if stalled else self.mode,
+                "stalled": stalled,
+                "loop_age_sec": age,
                 "halted": self.halted,
                 "halt_reason": self.halt_reason,
                 "kill_switch": self.kill_switch_engaged(),

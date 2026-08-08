@@ -8,9 +8,12 @@ from dataclasses import dataclass
 from typing import Callable, Optional
 
 from quantfund.core.config import RiskLimits, sector_of as default_sector_of
+from quantfund.core.greeks import bs_greeks, implied_vol
 from quantfund.core.instruments import AssetClass, Equity, Option, OptionRight
 from quantfund.core.orders import Order, OrderSide
-from quantfund.core.portfolio import Portfolio
+from quantfund.core.portfolio import (
+    Portfolio, option_exposure, option_group_key, option_theta_per_day,
+)
 from quantfund.core.snapshot import MarketSnapshot
 
 
@@ -36,7 +39,19 @@ def _leg_price(leg: OrderLeg, snapshot: MarketSnapshot) -> Optional[float]:
     return None
 
 
-def _leg_greeks(leg: OrderLeg, snapshot: MarketSnapshot):
+def _leg_greeks(leg: OrderLeg, snapshot: MarketSnapshot, risk_free: float = 0.04):
+    """Greeks for an option leg: chain greeks, else Black-Scholes off chain IV,
+    else IV implied from the quote — the SAME fallback ladder Portfolio uses
+    when marking.
+
+    Without the fallback the gate and the book measure different things. Alpaca
+    serves no greeks on 0DTE contracts, so the gate sized those orders by
+    premium while the portfolio marked them with BS delta. On 2026-08-07 that
+    let a 21-lot QQQ 0DTE call through as "$1,911 of exposure" and it landed on
+    the book as $510,170 — pushing net dollar delta to 6.39x equity against a
+    3.0x limit. A risk gate must authorize using the same yardstick the book
+    reports, whichever yardstick that is.
+    """
     inst = leg.instrument
     if not isinstance(inst, Option):
         return None
@@ -44,14 +59,32 @@ def _leg_greeks(leg: OrderLeg, snapshot: MarketSnapshot):
     if chain is None:
         return None
     oq = next((q for q in chain.quotes if q.instrument.symbol == inst.symbol), None)
-    return oq.greeks if oq else None
+    if oq is None:
+        return None
+    if oq.greeks is not None:
+        return oq.greeks
+    under_px = chain.underlying_price
+    price = oq.quote.mid
+    if not under_px or under_px <= 0 or price <= 0:
+        return None
+    t = inst.years_to_expiration(snapshot.as_of)
+    if t <= 0:
+        return None
+    iv = oq.iv
+    if iv is None:
+        iv = implied_vol(inst.right, price, under_px, inst.strike, t, risk_free)
+    if iv is None:
+        return None
+    return bs_greeks(inst.right, under_px, inst.strike, t, iv, risk_free)
 
 
 class RiskManager:
     def __init__(self, limits: RiskLimits,
-                 sector_of: Callable[[str], str] = default_sector_of):
+                 sector_of: Callable[[str], str] = default_sector_of,
+                 risk_free: float = 0.04):
         self.limits = limits
         self.sector_of = sector_of
+        self.risk_free = risk_free
 
     # ── naked-short detection ────────────────────────────────────────────
 
@@ -237,6 +270,29 @@ class RiskManager:
             return abs(post) > cap and abs(post) > abs(pre) + 1e-9
 
         expo_by_under = portfolio.exposure_by_underlying()
+        # Groups that hold (or will hold) shorts must be measured on one basis
+        # so spread legs offset — see option_exposure(group_has_short=...).
+        # A group counts as "holding shorts" only if a contract in it is short
+        # NOW or will be short AFTER this order. A SELL that merely CLOSES a
+        # long must not flip the basis — doing so measured the pre-trade side
+        # by premium and the post-trade side by delta notional, which rejected
+        # stop-losses all over again.
+        _post_qty: dict[str, tuple] = {}
+        for p in portfolio.positions.values():
+            if p.is_open and isinstance(p.instrument, Option):
+                _post_qty[p.instrument.key] = (p.instrument, p.qty)
+        for _lg in order.legs:
+            if isinstance(_lg.instrument, Option):
+                _i = _lg.instrument
+                _, _q = _post_qty.get(_i.key, (_i, 0.0))
+                _post_qty[_i.key] = (_i, _q + _lg.side.sign * _lg.qty)
+        _short_groups = {
+            option_group_key(p.instrument)
+            for p in portfolio.positions.values()
+            if p.is_open and isinstance(p.instrument, Option) and p.qty < 0
+        } | {
+            option_group_key(_i) for _i, _q in _post_qty.values() if _q < -1e-9
+        }
         delta_expo: dict[str, float] = {}
         gross_delta = 0.0
         dollar_delta_change = 0.0
@@ -249,16 +305,50 @@ class RiskManager:
                 d_expo = signed_qty * leg_prices[i]
                 dollar_delta_change += d_expo
             else:
-                g = _leg_greeks(leg, snapshot)
+                g = _leg_greeks(leg, snapshot, self.risk_free)
                 under_px = snapshot.last_price(inst.underlying_symbol) or 0.0
+                # Exposure CHANGE = post-trade position exposure minus
+                # pre-trade, evaluated with the same option_exposure rule the
+                # book uses. It must be a difference of positions, never a
+                # function of the leg alone: option_exposure treats qty < 0 as
+                # a SHORT POSITION, but a negative leg is a SELL, which for a
+                # long holding is a CLOSE. Measuring the leg directly priced a
+                # 21-lot stop-loss as opening a $422k short and the gate
+                # rejected it — the stop could not execute and a losing 0DTE
+                # call sat open past its -35% trigger (2026-08-07 16:24-16:27).
+                pos_now = portfolio.positions.get(inst.key)
+                cur_qty = pos_now.qty if pos_now else 0.0
+                _expo_args = dict(
+                    multiplier=inst.multiplier,
+                    delta=(g.delta if g is not None else None),
+                    underlying_price=under_px, premium=leg_prices[i],
+                    group_has_short=option_group_key(inst) in _short_groups)
+                d_expo = (
+                    option_exposure(qty=cur_qty + signed_qty, **_expo_args,
+                                    fallback=(cur_qty + signed_qty)
+                                    * leg_prices[i] * inst.multiplier)
+                    - option_exposure(qty=cur_qty, **_expo_args,
+                                      fallback=cur_qty * leg_prices[i]
+                                      * inst.multiplier))
                 if g is not None and under_px > 0:
-                    d_expo = g.delta * signed_qty * inst.multiplier * under_px
-                    dollar_delta_change += d_expo
-                    theta_change += g.theta * signed_qty * inst.multiplier
+                    # net dollar delta stays RAW delta: it measures directional
+                    # sensitivity, not loss, and is bounded by its own limit
+                    dollar_delta_change += g.delta * signed_qty * inst.multiplier * under_px
+                    # Theta is premium-BOUNDED for longs, so like exposure it
+                    # must be a difference of positions. Adding unbounded leg
+                    # theta to a bounded portfolio theta made CLOSING a long
+                    # look like it increased decay ($8,605/day on a book whose
+                    # bounded theta was $1,932), which rejected the stop-loss
+                    # a second time after the exposure fix.
+                    theta_change += (
+                        option_theta_per_day(
+                            qty=cur_qty + signed_qty, multiplier=inst.multiplier,
+                            theta=g.theta, premium=leg_prices[i])
+                        - option_theta_per_day(
+                            qty=cur_qty, multiplier=inst.multiplier,
+                            theta=g.theta, premium=leg_prices[i]))
                     vega_change += g.vega * signed_qty * inst.multiplier
                 else:
-                    # long option without greeks: bound exposure by premium
-                    d_expo = signed_qty * leg_prices[i] * inst.multiplier
                     dollar_delta_change += d_expo
             u = inst.underlying
             delta_expo[u] = delta_expo.get(u, 0.0) + d_expo

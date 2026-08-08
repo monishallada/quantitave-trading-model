@@ -2,10 +2,16 @@
 account. Handles single-leg equity/option orders and multi-leg (MLEG) option
 spreads, order status, fills, position sync, and flatten-all.
 
-Note on costs: Alpaca paper fills report no explicit commission/fee fields, so
-Fills from this broker carry commission=fees=slippage_cost=0 — real friction is
-embedded in the fill price the paper engine gives us. The CostModel applies to
-the SimBroker/backtests only.
+Note on costs: Alpaca paper fills report no explicit commission/fee fields. The
+spread is real friction and IS captured — we fill at the touch and mark at mid,
+so it lands in P&L. Per-contract option fees are not reported at all, and a
+blotter built straight from Alpaca's numbers shows every trade as free. Fills
+from this broker therefore carry MODELED commission/fees from the CostModel
+(clearly labelled as modeled, never as broker-reported); slippage stays 0
+because the fill price is the broker's, not simulated. This matters most for
+high-turnover sleeves: 0DTE runs ~480 contract-legs/day, which at $0.65/contract
+is ~$328/day of friction that would otherwise be invisible. Equity and cash are
+always taken from the broker account, so this only corrects the cost ledger.
 """
 from __future__ import annotations
 
@@ -30,6 +36,7 @@ from alpaca.trading.requests import (
 )
 
 from quantfund.core.config import Settings
+from quantfund.core.costs import CostConfig, CostModel
 from quantfund.core.instruments import Equity, Instrument, parse_occ_symbol
 from quantfund.core.orders import (
     Fill, Order, OrderSide, OrderStatus, OrderType,
@@ -39,6 +46,24 @@ from quantfund.execution.broker import (
 )
 
 log = logging.getLogger(__name__)
+
+
+def apply_http_timeout(client, timeout: tuple[float, float] = (10.0, 30.0)):
+    """alpaca-py creates its requests.Session with NO timeout, so a stalled
+    socket blocks forever. On 2026-08-06 that hung the live trading thread
+    mid-session for 37h while the dashboard still reported "live". Every
+    Alpaca client must go through this."""
+    sess = getattr(client, "_session", None)
+    if sess is None:
+        return client
+    original = sess.request
+
+    def request_with_timeout(method, url, **kwargs):
+        kwargs.setdefault("timeout", timeout)
+        return original(method, url, **kwargs)
+
+    sess.request = request_with_timeout
+    return client
 
 _STATUS_MAP = {
     "new": OrderStatus.SUBMITTED,
@@ -77,9 +102,12 @@ class AlpacaPaperBroker(Broker):
                              "mode required (ALPACA_PAPER must be true)")
         if not settings.has_alpaca:
             raise ValueError("Alpaca API keys missing")
-        self._client = TradingClient(
+        self._client = apply_http_timeout(TradingClient(
             settings.alpaca_api_key, settings.alpaca_secret_key, paper=True,
-        )
+        ))
+        # Used ONLY to model the fees Alpaca paper does not report. Execution
+        # prices come from the broker; this never invents a fill price.
+        self._costs = CostModel(CostConfig())
         # order_id -> (strategy_id, rationale_id) so fills can be attributed
         self._order_meta: dict[str, tuple[str, str]] = {}
         self._seen_fill_keys: set[str] = set()
@@ -195,12 +223,22 @@ class AlpacaPaperBroker(Broker):
                             or getattr(o, "updated_at", None))
                 if ts is None:
                     continue
+                inst = _to_instrument(str(leg.symbol))
+                side = OrderSide.BUY if raw_side == "buy" else OrderSide.SELL
+                commission, fees = self._costs.commission_and_fees(inst, side, lq, lp)
                 fills.append(Fill(
                     order_id=str(o.id),
-                    instrument=_to_instrument(str(leg.symbol)),
-                    side=OrderSide.BUY if raw_side == "buy" else OrderSide.SELL,
+                    instrument=inst, side=side,
                     qty=lq, price=lp, ts=ts,
-                    commission=0.0, fees=0.0, slippage_cost=0.0,
+                    # MODELED, not reported: Alpaca paper returns no fee fields,
+                    # so a blotter built from its numbers shows every trade as
+                    # free. Spread cost is already real (we fill at the touch
+                    # and mark at mid), but per-contract fees are not, and a
+                    # sleeve doing ~480 contract-legs a day makes that
+                    # understatement material — ~$328/day at $0.65/contract.
+                    # Equity is still taken from the broker account, so this
+                    # only corrects the cost ledger; it cannot desync the book.
+                    commission=commission, fees=fees, slippage_cost=0.0,
                     strategy_id=strategy_id,
                 ))
         return fills
